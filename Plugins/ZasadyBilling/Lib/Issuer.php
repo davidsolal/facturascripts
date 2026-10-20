@@ -3,7 +3,6 @@
 namespace FacturaScripts\Plugins\ZasadyBilling\Lib;
 
 use FacturaScripts\Core\Lib\Calculator;
-use FacturaScripts\Core\Lib\InvoiceOperation;
 use FacturaScripts\Core\Lib\TaxExceptions;
 use FacturaScripts\Core\Model\FacturaCliente;
 use FacturaScripts\Core\Model\Impuesto;
@@ -48,8 +47,19 @@ final class Issuer
         $factura->tasaconv = $rate->usdPerEur;
         $factura->fecha = $isoDate;
         $factura->fechadevengo = Period::dueDate($isoDate);
-        $factura->operacion = InvoiceOperation::EXPORT;
-        $factura->observaciones = 'ECB rate ' . $rate->dateUsed . ' (1 EUR = ' . $rate->usdPerEur . ' USD).';
+        // Deliberately leave operacion unset. Core's
+        // TaxExceptions::isValidCombination() only pairs
+        // InvoiceOperation::EXPORT ('exportacion') with
+        // ES_TAX_EXCEPTION_21 (goods exports), and Cliente::test()
+        // enforces that pairing on the client record. Our case is
+        // services supplied by a Spanish autonomo to a US business with
+        // place of supply outside Spain - the correct classification is
+        // arts. 68-70 LIVA (ES_TAX_EXCEPTION_68_70 below on the line),
+        // which core only allows when operacion is EMPTY. Setting
+        // 'exportacion' here would mismatch the line's exception and make
+        // the client record unsavable.
+        $factura->observaciones = 'ECB rate ' . $rate->dateUsed . ' (1 EUR = ' . $rate->usdPerEur
+            . ' USD). Out of scope of Spanish VAT under arts. 68-70 LIVA (services to a non-EU business).';
         if (false === $factura->save()) {
             throw new \RuntimeException('invoice save failed for company ' . $p->idempresa);
         }
@@ -84,7 +94,9 @@ final class Issuer
         // Re-read from the DB: Calculator::calculate() mutates $factura in
         // place, but reloading guarantees totaleuros/idasiento reflect what
         // was actually persisted (including anything a save hook changed).
-        $factura->load($factura->idfactura);
+        if (false === $factura->load($factura->idfactura)) {
+            throw new \RuntimeException('invoice reload failed for company ' . $p->idempresa . ' after save');
+        }
 
         Period::markIssued($p->idempresa, $isoDate, $factura->codigo);
 
