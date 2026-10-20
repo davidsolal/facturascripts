@@ -114,7 +114,7 @@ class ZasadyExport extends PDFExport
         // $model->fecha claimed the rate was from the 19th while the
         // observations on the same page said the 18th.
         //
-        // The metadata lives in Settings keyed by the invoice code (see
+        // The metadata lives in Settings keyed by company + invoice code (see
         // Lib\RateToken - never in observaciones, which core's stock PDF prints
         // verbatim). An invoice issued before it was stored has no entry: the
         // rate date then falls back to the invoice date, exactly as this line
@@ -150,12 +150,15 @@ class ZasadyExport extends PDFExport
      */
     private function rateMeta($model): ?array
     {
-        $codigo = RateToken::key((string)($model->codigo ?? ''));
-        if ($codigo === '') {
+        // Company-scoped: the code alone identifies an invoice only within one
+        // company's series (both companies' September invoice is F2600010), so
+        // looking it up by code would print another company's rate here.
+        $key = RateToken::key((int)($model->idempresa ?? 0), (string)($model->codigo ?? ''));
+        if ($key === '') {
             return null;
         }
 
-        $stored = Tools::settings(RateToken::GROUP, $codigo, '');
+        $stored = Tools::settings(RateToken::GROUP, $key, '');
 
         return RateToken::decode(is_string($stored) ? $stored : null);
     }

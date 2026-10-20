@@ -79,11 +79,24 @@ final class RateTokenTest extends TestCase
         $this->assertNull(RateToken::decode('["2026-09-18","ecb"]'));
     }
 
-    public function testKeyIsTheInvoiceCode(): void
+    public function testKeyScopesTheInvoiceToItsCompany(): void
     {
-        $this->assertSame('F2600010', RateToken::key('F2600010'));
-        $this->assertSame('F2600010', RateToken::key(' F2600010 '));
-        $this->assertSame('', RateToken::key(''));
+        // Invoice codes are unique per company only: both companies' September
+        // invoice is F2600010, so the key must carry the company or the two
+        // documents share one rate entry.
+        $this->assertSame('1-F2600010', RateToken::key(1, 'F2600010'));
+        $this->assertSame('2-F2600010', RateToken::key(2, 'F2600010'));
+        $this->assertSame('1-F2600010', RateToken::key(1, ' F2600010 '));
+        $this->assertNotSame(RateToken::key(1, 'F2600010'), RateToken::key(2, 'F2600010'));
+    }
+
+    public function testKeyIsEmptyWhenItCannotIdentifyOneInvoice(): void
+    {
+        // '' is the callers' "do not store / do not look up" signal: it degrades
+        // to the invoice-date fallback instead of writing under a partial key.
+        $this->assertSame('', RateToken::key(1, ''));
+        $this->assertSame('', RateToken::key(1, '   '));
+        $this->assertSame('', RateToken::key(0, 'F2600010'));
     }
 
     public function testParseLegacyReadsTheHistoricalTokenIncludingItsEscapedForm(): void

@@ -177,13 +177,15 @@ final class Issuer
             throw new \RuntimeException('invoice reload failed for company ' . $p->idempresa . ' after save');
         }
 
-        // Rate provenance, machine-readable, keyed by the invoice code just
-        // assigned by the save above. Written before (and independently of) the
-        // period marker: the marker guards against a second invoice, this is
-        // the document's own metadata. Failing loudly is deliberate - the
-        // invoice exists and is non-editable, and a run that silently loses the
+        // Rate provenance, machine-readable, keyed by the company and the code
+        // just assigned by the save above (codes are unique per company only,
+        // so the company must be part of the key - see RateToken::key()).
+        // Written before (and independently of) the period marker: the marker
+        // guards against a second invoice, this is the document's own
+        // metadata. Failing loudly is deliberate - the invoice exists and is
+        // non-editable, and a run that silently loses the
         // rate provenance would print a rate date nobody can prove.
-        if (false === $this->rememberRate((string)$factura->codigo, $rate)) {
+        if (false === $this->rememberRate((int)$factura->idempresa, (string)$factura->codigo, $rate)) {
             throw new \RuntimeException(
                 'invoice ' . $factura->codigo . ' was issued but its rate metadata ('
                 . $rate->dateUsed . '/' . $rate->source . ') could not be saved in settings '
@@ -213,17 +215,21 @@ final class Issuer
     }
 
     /**
-     * Persists the rate actually used for $codigo and reports whether the
-     * settings table accepted the write.
+     * Persists the rate actually used for $codigo in company $idempresa and
+     * reports whether the settings table accepted the write.
+     *
+     * Both parts of the key matter: `codigo` is unique per company only, so
+     * storing by code alone let two companies share one entry and would print
+     * one company's manual override on the other company's invoice.
      *
      * Tools::settingsSet() only fills an in-memory cache, so its result has to
      * be flushed with settingsSave() - the same trap Profile::save() and
      * Period::markIssued() document. A returned false here means the metadata
      * is gone while the invoice is already immutable, hence the caller's throw.
      */
-    private function rememberRate(string $codigo, Rate $rate): bool
+    private function rememberRate(int $idempresa, string $codigo, Rate $rate): bool
     {
-        $key = RateToken::key($codigo);
+        $key = RateToken::key($idempresa, $codigo);
         if ($key === '') {
             return false;
         }

@@ -9,10 +9,10 @@ namespace FacturaScripts\Plugins\ZasadyBilling\Lib;
  * operator override), so the printed conversion never claims "ECB" for a
  * manual rate.
  *
- * Stored in core Settings - group GROUP, key = the invoice `codigo`, value =
- * compact JSON `{"date":"YYYY-MM-DD","source":"ecb|manual"}` - and NOT in
- * `facturascli.observaciones`. That column is core schema and is printed
- * verbatim by the stock PDFDocument, so any machine-readable payload kept
+ * Stored in core Settings - group GROUP, key = company id + invoice code (see
+ * key()), value = compact JSON `{"date":"YYYY-MM-DD","source":"ecb|manual"}` -
+ * and NOT in `facturascli.observaciones`. That column is core schema and is
+ * printed verbatim by the stock PDFDocument, so any machine-readable payload kept
  * there reached client documents through every render path except ours (the
  * stock "PDF" option emitted `[zasady-rate]{...}` into an invoice). The invoice
  * therefore carries the human sentence only; the metadata lives beside it in
@@ -34,7 +34,7 @@ namespace FacturaScripts\Plugins\ZasadyBilling\Lib;
  */
 final class RateToken
 {
-    /** Settings group holding one entry per invoice code. */
+    /** Settings group holding one entry per company-scoped invoice key. */
     public const GROUP = 'zasady-rate';
 
     /** Historical wire format, kept only for cleanup and defence. */
@@ -46,12 +46,28 @@ final class RateToken
     private const DATE_PATTERN = '/^\d{4}-\d{2}-\d{2}$/';
 
     /**
-     * Settings key for an invoice. The code is already unique per company
-     * series, and it is what the exporter has on hand.
+     * Settings key for an invoice: company id + invoice code.
+     *
+     * The bare code is NOT a usable key. Codes are unique per company only -
+     * two legal entities each number their own F26 series from 10, so
+     * `F2600010` names two different documents. Keyed by the code alone both
+     * companies shared a single entry: while they happen to hold the same rate
+     * today nothing shows, but a manual override written for one company would
+     * be printed on the other company's invoice - a rate that does not belong
+     * to that document, on a legal document.
+     *
+     * Returns '' when either part is missing. Every caller treats '' as "do not
+     * store / do not look up", which degrades to the documented invoice-date
+     * fallback instead of writing metadata under a partial key.
      */
-    public static function key(string $codigo): string
+    public static function key(int $idempresa, string $codigo): string
     {
-        return trim($codigo);
+        $code = trim($codigo);
+        if ($idempresa <= 0 || $code === '') {
+            return '';
+        }
+
+        return $idempresa . '-' . $code;
     }
 
     /**

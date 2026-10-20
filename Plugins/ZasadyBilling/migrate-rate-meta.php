@@ -2,7 +2,7 @@
 // Plugins/ZasadyBilling/migrate-rate-meta.php
 // One-off migration: move the machine-readable rate metadata out of
 // `facturascli.observaciones` into core Settings (group RateToken::GROUP,
-// key = invoice codigo), and clear it out of the printed field.
+// key = idempresa + invoice codigo), and clear it out of the printed field.
 //
 // Why it is needed: invoices issued before the metadata moved to Settings carry
 // a `[zasady-rate]{...}[/zasady-rate]` suffix in observaciones, and core's stock
@@ -73,7 +73,10 @@ foreach ($rows as $row) {
         fwrite(STDERR, sprintf('warning: %s: unparsable rate token, stripping without metadata%s', $label, PHP_EOL));
     }
 
-    $key = RateToken::key($codigo);
+    // The key must carry the company: the same code exists in several
+    // companies (see RateToken::key()), and this row's own idempresa is the
+    // only thing that says which invoice the metadata belongs to.
+    $key = RateToken::key((int)$row['idempresa'], $codigo);
     if ($key === '') {
         fwrite(STDERR, sprintf('error: %s: empty codigo, cannot key the settings entry%s', $label, PHP_EOL));
         $errors++;
