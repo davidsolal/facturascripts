@@ -14,8 +14,16 @@ use FacturaScripts\Core\Where;
  */
 final class IssuerGuard
 {
-    /** @return string[] blockers; empty means the invoice may be issued */
-    public static function check(Profile $p, ?Rate $rate, string $isoDate): array
+    /**
+     * @param string|null $codejercicio the exercise YearSetup::ensure()
+     *     resolved for this profile's series/date, or null when the caller
+     *     has not provisioned one (e.g. a series-less profile, or a unit
+     *     test that intentionally stays DB-free - see YearSetupTest and the
+     *     docblock below). Passing null skips the accounting-plan check
+     *     entirely rather than treating "unknown" as "missing".
+     * @return string[] blockers; empty means the invoice may be issued
+     */
+    public static function check(Profile $p, ?Rate $rate, string $isoDate, ?string $codejercicio = null): array
     {
         $out = [];
         if (false === $p->enabled) {
@@ -32,6 +40,16 @@ final class IssuerGuard
         }
         if (Period::isIssued($p->idempresa, $isoDate)) {
             $out[] = 'period already issued';
+        }
+
+        // This is a READ, not provisioning: MonthlyRun::runFor() calls
+        // YearSetup::ensure() before check() runs and hands us the
+        // resulting exercise code. check() only asks whether that exercise
+        // already has a chart of accounts - it must never create the
+        // exercise, the sequence, or the chart itself (see YearSetup's
+        // docblock on why the plan can't be auto-imported).
+        if (null !== $codejercicio && false === YearSetup::hasAccountingPlan($codejercicio)) {
+            $out[] = YearSetup::missingAccountingPlanBlocker($codejercicio);
         }
 
         // Only hit the database when there's actually a client code to look
