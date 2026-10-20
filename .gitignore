@@ -4,7 +4,9 @@
 /doc/
 /MyFiles/
 /node_modules/
-/Plugins/
+!/Plugins/
+/Plugins/*
+!/Plugins/ZasadyBilling/
 /vendor/
 .DS_Store
 .htaccess
