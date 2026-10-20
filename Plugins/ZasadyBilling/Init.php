@@ -18,6 +18,17 @@ class Init extends InitClass
         // resolves the key to \FacturaScripts\Dinamic\Lib\Export\ZasadyExport,
         // which dev-stack/install.sh shims to our plugin class — see that
         // script for why the class must live under Dinamic.
+        //
+        // Degradation mode: the option is registered unconditionally, but the
+        // class only resolves once the Dinamic shim exists. If it is missing
+        // (fresh checkout where install.sh has not run, or Dinamic/ was
+        // wiped), the menu still offers "Zasady" and core's plain PDFExport
+        // renders instead — a valid PDF, silently without the EUR/rate line.
+        // No runtime check here on purpose: a file_exists() probe on every
+        // boot buys nothing that a correct shim does not already give, and
+        // failing loudly would take the whole app down over a cosmetic line.
+        // Remedy: run dev-stack/install.sh, or re-enable the plugin (core's
+        // PluginsDeploy regenerates the shim once the plugin is enabled).
         ExportManager::addOption('Zasady', 'Zasady bilingual invoice (EN/ES)', 'fa-solid fa-file-invoice');
     }
 

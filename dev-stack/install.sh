@@ -110,10 +110,16 @@ fi
 # ---------------------------------------------------------------- ZasadyBilling export shim
 # ExportManager (Core/Lib/ExportManager.php) only ever resolves an export
 # option to \FacturaScripts\Dinamic\Lib\Export\<Option>Export — it checks the
-# Dinamic namespace first, then falls back to Core, but never to Plugins. The
-# Dinamic/ tree is generated and git-ignored, so the shim has to be (re)written
-# by this script rather than committed. Guarded by -f: safe to re-run, and it
-# never touches a shim a developer has since customized.
+# Dinamic namespace first, then falls back to Core, but never to Plugins. So
+# the plugin class is only reachable through a Dinamic shim, and since Dinamic/
+# is generated and git-ignored no shim can be committed.
+#
+# Why this script writes it: core's PluginsDeploy does regenerate the shim once
+# the plugin is enabled, but this stack runs install.sh before anyone logs in to
+# enable a plugin — so we need the shim in that window too, and whenever the
+# plugin is disabled or the deploy never ran. Writing it here is idempotent and
+# costs nothing when PluginsDeploy would have produced the same file. Guarded by
+# -f: safe to re-run, and it never touches a shim a developer has customized.
 #
 # Dinamic/ is created root-owned inside the container (same cause as the
 # Plugins/MyFiles fixup above, but install.sh never chowned Dinamic/), so the

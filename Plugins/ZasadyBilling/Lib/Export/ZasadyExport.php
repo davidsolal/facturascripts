@@ -1,25 +1,9 @@
 <?php
-/**
- * This file is part of FacturaScripts
- * Copyright (C) 2017-2025 Carlos Garcia Gomez <carlos@facturascripts.com>
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Lesser General Public License as
- * published by the Free Software Foundation, either version 3 of the
- * License, or (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public License
- * along with this program. If not, see <http://www.gnu.org/licenses/>.
- */
 
 namespace FacturaScripts\Plugins\ZasadyBilling\Lib\Export;
 
 use FacturaScripts\Core\Lib\Export\PDFExport;
+use FacturaScripts\Core\Tools;
 
 /**
  * Bilingual (EN/ES) invoice export. Renders the stock FacturaScripts PDF
@@ -68,18 +52,23 @@ class ZasadyExport extends PDFExport
             return;
         }
 
-        // Literal bilingual text for this line: it has no equivalent core
-        // translation key (checked en_EN.json / es_ES.json), and inventing a
-        // new i18n key for a two-language client who reads both anyway adds
-        // maintenance cost for no benefit. 'date', 'total' etc. elsewhere in
-        // the PDF already come from core's own trans() calls.
+        // Literal bilingual text for this line: no core i18n key for an
+        // exchange rate exists (checked en_EN.json / es_ES.json), and the
+        // plugin ships no Translation/ directory, so there is nothing to
+        // trans() against. 'date', 'total' etc. elsewhere in the PDF already
+        // come from core's own trans() calls.
+        //
+        // Both figures go through Tools::number() so the separators follow the
+        // instance's decimal_separator/thousands_separator settings instead of
+        // being hardcoded — the rest of the PDF formats the same way, and a
+        // mixed-format invoice would read as two different numbers.
         $this->pdf->ezText(
             sprintf(
                 'Exchange rate / Tipo de cambio (%s): 1 EUR = %s %s     Total EUR / Total en EUR: %s EUR',
                 $model->fecha,
-                number_format((float)$model->tasaconv, 4, ',', ' '),
+                Tools::number((float)$model->tasaconv, 4),
                 $model->coddivisa,
-                number_format((float)$model->totaleuros, 2, ',', ' ')
+                Tools::number((float)$model->totaleuros, 2)
             ),
             self::FONT_SIZE
         );
