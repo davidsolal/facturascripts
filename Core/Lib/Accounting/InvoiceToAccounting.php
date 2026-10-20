@@ -587,6 +587,12 @@ class InvoiceToAccounting extends AccountingClass
             return;
         }
 
+        // Cent-level drift repair for foreign-currency documents: each line is
+        // converted and rounded on its own, so multi-line/multi-tax entries can
+        // end a cent off the customer line. absorbCurrencyRounding() is a no-op
+        // unless that is the case; anything larger than a few cents is a real
+        // imbalance and is still reported below.
+        $this->absorbCurrencyRounding($entry);
         if (false === $entry->isBalanced()) {
             Tools::log()->warning('unbalanced-accounting-entry', [
                 '%document%' => $entry->documento,
@@ -656,6 +662,12 @@ class InvoiceToAccounting extends AccountingClass
             return;
         }
 
+        // Cent-level drift repair for foreign-currency documents: each line is
+        // converted and rounded on its own, so multi-line/multi-tax entries can
+        // end a cent off the customer line. absorbCurrencyRounding() is a no-op
+        // unless that is the case; anything larger than a few cents is a real
+        // imbalance and is still reported below.
+        $this->absorbCurrencyRounding($entry);
         if (false === $entry->isBalanced()) {
             Tools::log()->warning('unbalanced-accounting-entry', [
                 '%document%' => $entry->documento,
@@ -682,12 +694,69 @@ class InvoiceToAccounting extends AccountingClass
         $entry->documento = $this->document->codigo;
         $entry->fecha = $this->document->fechadevengo ?? $this->document->fecha;
         $entry->idempresa = $this->document->idempresa;
-        $entry->importe = $this->document->total;
+        // The entry's importe is a face-currency amount on foreign-currency
+        // documents, so it books in the default currency like every line.
+        $entry->importe = $this->toDefaultCurrency((float)$this->document->total);
 
         $serie = new Serie();
         $serie->load($this->document->codserie);
 
         $entry->iddiario = $serie->iddiario;
         $entry->canal = $serie->canal;
+    }
+
+    /**
+     * Repair for cent-level drift on foreign-currency entries: each line is
+     * converted from its face amount and rounded on its own, so an entry whose
+     * lines sum to, say, EUR 4,458.22 can sit one cent under a customer line of
+     * EUR 4,458.23. The entry must stay balanced or core deletes it, leaving
+     * the document unaccounted - so the last line absorbs the difference,
+     * exactly the correction an accountant types by hand. Only cents are
+     * absorbed (anything larger is a real imbalance the caller still reports)
+     * and default-currency documents never enter here: they cannot drift.
+     *
+     * @param Asiento $entry
+     *
+     * @return bool
+     */
+    protected function absorbCurrencyRounding(Asiento $entry): bool
+    {
+        if (empty($this->document->coddivisa)
+            || $this->document->coddivisa === Tools::settings('default', 'coddivisa', '')) {
+            return true;
+        }
+
+        // Recompute from the lines instead of reading $entry->debe/haber: those
+        // header columns are not kept in sync while lines are added, whereas
+        // isBalanced() sums the lines - the method must see the same amounts.
+        $debe = 0.0;
+        $haber = 0.0;
+        $lines = $entry->getLines();
+        foreach ($lines as $line) {
+            $debe += $line->debe;
+            $haber += $line->haber;
+        }
+
+        $difference = round($debe - $haber, 2);
+        if (abs($difference) < 0.005 || abs($difference) > 0.05) {
+            // balanced already, or an imbalance too big to be rounding
+            return abs($difference) < 0.005;
+        }
+
+        // getLines() returns orden DESC, so its first element is the newest
+        // line - the revenue/goods side, written last. The counterpart line
+        // (customer/supplier receivable) keeps its exact converted amount so
+        // it keeps tying to the document total.
+        $last = reset($lines);
+        if (false === $last) {
+            return false;
+        }
+
+        if ($difference > 0) {
+            $last->haber += $difference;
+        } else {
+            $last->debe += abs($difference);
+        }
+        return $last->save();
     }
 }

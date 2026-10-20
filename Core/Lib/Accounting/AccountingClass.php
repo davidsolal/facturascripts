@@ -63,6 +63,30 @@ abstract class AccountingClass extends AccountingAccounts
     }
 
     /**
+     * Converts a document-currency ("face") amount into the company's default
+     * currency. A document issued in a foreign currency must book its value in
+     * the default currency, never its face value: an USD 5,000 invoice with an
+     * ECB rate of 1.1215 is EUR 4,458.23 of revenue, not EUR 5,000. The document
+     * already carries its own conversion of the grand total (totaleuros =
+     * total / tasaconv), so the ratio totaleuros/total converts any face amount
+     * with the same rate and the same rounding the document itself uses.
+     *
+     * Documents in the default currency (or without one) pass through
+     * unchanged, and a zero total (unpriced documents) cannot produce a ratio
+     * so it passes through too: there is nothing to convert.
+     */
+    protected function toDefaultCurrency(float $face): float
+    {
+        if ($face === 0.0 || empty($this->document->coddivisa)
+            || $this->document->coddivisa === Tools::settings('default', 'coddivisa', '')
+            || empty($this->document->total)) {
+            return $face;
+        }
+
+        return round($face * (float)$this->document->totaleuros / (float)$this->document->total, 2);
+    }
+
+    /**
      * Add a group of lines from array of subaccounts/amount.
      *
      * @param Asiento $accountEntry
@@ -127,8 +151,11 @@ abstract class AccountingClass extends AccountingAccounts
             $line->setCounterpart($counterpart);
         }
 
-        // add tax register data
-        $line->baseimponible = (float)$values['neto'];
+        // add tax register data. The taxable base is a face-currency amount
+        // (neto), so it books in the default currency like the rest of the
+        // entry; iva is a percentage and recargo is stored as a percentage on
+        // this line, neither is converted.
+        $line->baseimponible = $this->toDefaultCurrency((float)$values['neto']);
         $line->iva = 0;
         $line->recargo = (float)$values['recargo'];
         $line->cifnif = $this->document->cifnif;
@@ -162,8 +189,10 @@ abstract class AccountingClass extends AccountingAccounts
             $line->setCounterpart($counterpart);
         }
 
-        // add tax register data
-        $line->baseimponible = (float)$values['neto'];
+        // add tax register data. The taxable base is a face-currency amount
+        // (neto), so it books in the default currency like the rest of the
+        // entry; the iva/recargo fields are percentages, never converted.
+        $line->baseimponible = $this->toDefaultCurrency((float)$values['neto']);
         $line->iva = (float)$values['iva'];
         $line->recargo = 0;
         $line->cifnif = $this->document->cifnif;
@@ -190,7 +219,14 @@ abstract class AccountingClass extends AccountingAccounts
         $line = $accountEntry->getNewLine();
         $line->setAccount($subaccount);
 
-        $total = ($amount === null) ? $this->document->total : $amount;
+        // Every amount reaching an entry line is face-currency (the document's
+        // total, its per-subaccount totals, its taxes), so all of them are
+        // converted here - the single choke point every line passes through.
+        // amount === null means "the document's grand total", whose conversion
+        // is totaleuros itself.
+        $total = $amount === null
+            ? $this->toDefaultCurrency((float)$this->document->total)
+            : $this->toDefaultCurrency($amount);
         if ($isDebit) {
             $line->debe = max($total, 0);
             $line->haber = $total < 0 ? abs($total) : 0;

@@ -14,7 +14,7 @@ final class MonthlyRun
      * @return array<int, string> human-readable outcome per company, keyed
      *     by idempresa so callers/tests can look up a specific company.
      */
-    public function runFor(\DateTimeImmutable $today, bool $force = false): array
+    public function runFor(\DateTimeImmutable $today, bool $force = false, ?\DateTimeImmutable $invoiceDate = null): array
     {
         $out = [];
         foreach (Profile::all() as $profile) {
@@ -25,12 +25,15 @@ final class MonthlyRun
             // missed 19th was never retried, so the month was simply lost.
             // The invoice date below is still the configured billing day of
             // the current month, never "today", so a late run cannot produce a
-            // future-dated invoice.
-            if ((int)$today->format('j') < $profile->day && false === $force) {
+            // future-dated invoice. An explicit --date override skips this
+            // check: the operator has named the date, not the calendar.
+            if ($invoiceDate === null
+                && (int)$today->format('j') < $profile->day
+                && false === $force) {
                 continue;
             }
 
-            $date = Period::invoiceDate((int)$today->format('Y'), (int)$today->format('n'), $profile->day);
+            $date = self::resolveInvoiceDate($today, $profile->day, $invoiceDate);
 
             // Everything below touches the DB (IssuerGuard::check() loads
             // Cliente / getDefaultAddress) or the network (EcbClient), on
@@ -100,9 +103,6 @@ final class MonthlyRun
      * was incomplete: the invoice is still issued (it is already correct enough
      * to be legal, and blocking would lose the month again) but the operator
      * must see it.
-     *
-     * Static and public so the rule can be unit-tested without a database: the
-     * sweep itself needs one, this decision does not.
      */
     public static function rateDateWarning(Rate $rate, string $invoiceDate): string
     {
@@ -115,5 +115,25 @@ final class MonthlyRun
             $invoiceDate,
             $rate->dateUsed
         );
+    }
+
+    /**
+     * The date an invoice must carry. Without an operator override it is the
+     * profile's configured billing day of $today's month (never "today", so a
+     * late catch-up run cannot produce a future-dated invoice). An explicit
+     * override wins and needs no billing-day check: it is the operator naming
+     * the date - the first issuance, a backfill, a contractual change - not the
+     * calendar deciding.
+     *
+     * Static and public so the rule can be unit-tested without a database: the
+     * sweep itself needs one, this decision does not.
+     */
+    public static function resolveInvoiceDate(\DateTimeImmutable $today, int $day, ?\DateTimeImmutable $override): string
+    {
+        if ($override !== null) {
+            return $override->format('Y-m-d');
+        }
+
+        return Period::invoiceDate((int)$today->format('Y'), (int)$today->format('n'), $day);
     }
 }
