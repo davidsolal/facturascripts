@@ -112,23 +112,52 @@ class ZasadyExport extends PDFExport
         // invoice date: the ECB publishes only on TARGET business days, so an
         // invoice dated Saturday 19-09-2026 uses Friday's rate. Printing
         // $model->fecha claimed the rate was from the 19th while the
-        // observations on the same page said the 18th. The token Issuer wrote
-        // into observaciones carries both values; older invoices without it
-        // fall back to the invoice date and omit the source.
-        $token = RateToken::parse($model->observaciones ?? '');
-        $rateDate = $token === null ? $this->dateLabel($model->fecha) : $this->dateLabel($token['date']);
-        $source = $token === null ? '' : ' (' . RateToken::sourceLabel($token['source']) . ', ' . $rateDate . ')';
+        // observations on the same page said the 18th.
+        //
+        // The metadata lives in Settings keyed by the invoice code (see
+        // Lib\RateToken - never in observaciones, which core's stock PDF prints
+        // verbatim). An invoice issued before it was stored has no entry: the
+        // rate date then falls back to the invoice date, exactly as this line
+        // printed before the metadata existed, and the source is omitted
+        // because claiming one would be a guess.
+        $meta = $this->rateMeta($model);
+        $rateLine = null === $meta
+            ? $this->dateLabel($model->fecha)
+            : RateToken::sourceLabel($meta['source']) . ', ' . $this->dateLabel($meta['date']);
 
         $this->pdf->ezText(
             sprintf(
-                'Exchange rate / Tipo de cambio%s: 1 EUR = %s %s     Total EUR / Total en EUR: %s EUR',
-                $source,
+                'Exchange rate / Tipo de cambio (%s): 1 EUR = %s %s     Total EUR / Total en EUR: %s EUR',
+                $rateLine,
                 Tools::number((float)$model->tasaconv, 4),
                 $model->coddivisa,
                 Tools::number((float)$model->totaleuros, 2)
             ),
             self::FONT_SIZE
         );
+    }
+
+    /**
+     * Rate metadata stored for this invoice, or null when there is none.
+     *
+     * Read through Tools::settings() (the getter) with an empty default: the
+     * key's absence is the documented "older invoice" case, and decode()
+     * rejects anything malformed, so a hand-edited or truncated value degrades
+     * to the invoice-date fallback instead of breaking the render.
+     *
+     * @param object $model
+     * @return array{date: string, source: string}|null
+     */
+    private function rateMeta($model): ?array
+    {
+        $codigo = RateToken::key((string)($model->codigo ?? ''));
+        if ($codigo === '') {
+            return null;
+        }
+
+        $stored = Tools::settings(RateToken::GROUP, $codigo, '');
+
+        return RateToken::decode(is_string($stored) ? $stored : null);
     }
 
     /**
@@ -170,10 +199,12 @@ class ZasadyExport extends PDFExport
      */
     public function insertBusinessDocFooter($model)
     {
-        // Core prints `observaciones` verbatim, and that field also carries the
-        // machine-readable rate token (see Lib\RateToken). Print the human
-        // sentence only, then restore the model exactly as it was: a PDF render
-        // must never mutate the document it is rendering.
+        // Core prints `observaciones` verbatim. Nothing writes the
+        // machine-readable rate token there any more (it lives in Settings, see
+        // Lib\RateToken), but invoices issued before that change still carry one
+        // in the database: strip it here so this export stays clean even on an
+        // unmigrated instance, then restore the model exactly as it was - a PDF
+        // render must never mutate the document it is rendering.
         $rawObservaciones = $model->observaciones ?? null;
         $model->observaciones = RateToken::strip($rawObservaciones);
         try {

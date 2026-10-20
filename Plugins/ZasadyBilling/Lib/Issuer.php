@@ -97,19 +97,17 @@ final class Issuer
         // The observation sentence is client-facing and must state what was
         // actually used: the ECB publication date (not the invoice date - they
         // differ whenever the invoice date is a weekend or TARGET holiday) and
-        // whether the operator overrode it. RateToken appends the same two
-        // values in machine-readable form for Lib\Export\ZasadyExport; that
-        // token is stripped again before the observations are printed.
-        $factura->observaciones = RateToken::embed(
-            sprintf(
-                '%s (1 EUR = %s USD). Out of scope of Spanish VAT under arts. 68-70 LIVA '
-                . '(services to a non-EU business).',
-                $rate->source === Rate::SOURCE_MANUAL
-                    ? 'Manual rate'
-                    : RateToken::sourceLabel($rate->source) . ' of ' . $rate->dateUsed,
-                Tools::number($rate->usdPerEur, 4)
-            ),
-            $rate
+        // whether the operator overrode it. It carries nothing machine-readable:
+        // core's stock PDFDocument prints this column verbatim, so a payload
+        // here reaches client documents on every render path except ours. The
+        // same two values are persisted in Settings by rememberRate() below.
+        $factura->observaciones = sprintf(
+            '%s (1 EUR = %s USD). Out of scope of Spanish VAT under arts. 68-70 LIVA '
+            . '(services to a non-EU business).',
+            $rate->source === Rate::SOURCE_MANUAL
+                ? 'Manual rate'
+                : RateToken::sourceLabel($rate->source) . ' of ' . $rate->dateUsed,
+            Tools::number($rate->usdPerEur, 4)
         );
         if (false === $factura->save()) {
             throw new \RuntimeException('invoice save failed for company ' . $p->idempresa);
@@ -179,6 +177,20 @@ final class Issuer
             throw new \RuntimeException('invoice reload failed for company ' . $p->idempresa . ' after save');
         }
 
+        // Rate provenance, machine-readable, keyed by the invoice code just
+        // assigned by the save above. Written before (and independently of) the
+        // period marker: the marker guards against a second invoice, this is
+        // the document's own metadata. Failing loudly is deliberate - the
+        // invoice exists and is non-editable, and a run that silently loses the
+        // rate provenance would print a rate date nobody can prove.
+        if (false === $this->rememberRate((string)$factura->codigo, $rate)) {
+            throw new \RuntimeException(
+                'invoice ' . $factura->codigo . ' was issued but its rate metadata ('
+                . $rate->dateUsed . '/' . $rate->source . ') could not be saved in settings '
+                . RateToken::GROUP . '; do not re-run blindly'
+            );
+        }
+
         if (false === Period::markIssued($p->idempresa, $isoDate, $factura->codigo)) {
             // The invoice exists and is non-editable: it cannot be rolled back,
             // and reporting success here would hide a period that the marker
@@ -198,6 +210,31 @@ final class Issuer
             // exercise/diary configured yet - that is not an error here.
             'idasiento' => (int)$factura->idasiento,
         ];
+    }
+
+    /**
+     * Persists the rate actually used for $codigo and reports whether the
+     * settings table accepted the write.
+     *
+     * Tools::settingsSet() only fills an in-memory cache, so its result has to
+     * be flushed with settingsSave() - the same trap Profile::save() and
+     * Period::markIssued() document. A returned false here means the metadata
+     * is gone while the invoice is already immutable, hence the caller's throw.
+     */
+    private function rememberRate(string $codigo, Rate $rate): bool
+    {
+        $key = RateToken::key($codigo);
+        if ($key === '') {
+            return false;
+        }
+
+        $value = RateToken::encode($rate);
+        if (null === $value) {
+            return false;
+        }
+
+        Tools::settingsSet(RateToken::GROUP, $key, $value);
+        return Tools::settingsSave();
     }
 
     /**
