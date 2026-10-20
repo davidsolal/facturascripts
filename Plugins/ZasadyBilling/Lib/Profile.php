@@ -91,13 +91,17 @@ final class Profile
     public function save(): void
     {
         $group = self::group($this->idempresa);
-        Tools::settings($group, 'enabled', $this->enabled ? '1' : '0');
-        Tools::settings($group, 'codserie', $this->codserie);
-        Tools::settings($group, 'codcliente', $this->codcliente);
-        Tools::settings($group, 'amount', (string)$this->amount);
-        Tools::settings($group, 'day', (string)$this->day);
-        Tools::settings($group, 'rate_override', (string)$this->rateOverride);
-        Tools::settings($group, 'description', $this->description);
+        // Tools::settings() is a getter whose third argument is only a fallback
+        // for a missing key: after load() has registered the defaults, calling it
+        // here writes nothing and the profile silently stays disabled. The setter
+        // is Tools::settingsSet(); settingsSave() then persists the whole cache.
+        Tools::settingsSet($group, 'enabled', $this->enabled ? '1' : '0');
+        Tools::settingsSet($group, 'codserie', $this->codserie);
+        Tools::settingsSet($group, 'codcliente', $this->codcliente);
+        Tools::settingsSet($group, 'amount', (string)$this->amount);
+        Tools::settingsSet($group, 'day', (string)$this->day);
+        Tools::settingsSet($group, 'rate_override', (string)$this->rateOverride);
+        Tools::settingsSet($group, 'description', $this->description);
         Tools::settingsSave();
     }
 
