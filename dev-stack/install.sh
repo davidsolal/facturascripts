@@ -73,6 +73,14 @@ for _ in $(seq 1 60); do
 done
 echo "✓ app responding on $BASE_URL"
 
+# Directories the app creates during install can end up root-owned, which breaks
+# plugin installs and uploads later. Fix from inside the container (a chown from
+# the host fails: the files are not ours).
+if [ -d "$ROOT/Plugins" ] || [ -d "$ROOT/MyFiles" ]; then
+    docker exec -u 0 facturascripts-app chown -R "$(id -u):$(id -g)" \
+        /var/www/html/Plugins /var/www/html/MyFiles 2>/dev/null || true
+fi
+
 # ---------------------------------------------------------------- installer
 if [ -f "$ROOT/config.php" ]; then
     echo "✓ config.php present, application already installed"
