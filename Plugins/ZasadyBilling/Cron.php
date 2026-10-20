@@ -20,8 +20,15 @@ final class Cron extends CronJobClass
 
     public static function run(): void
     {
+        // CronJobClass::echo()/saveEcho() are protected static, not
+        // private, so this subclass can call them directly: echo() both
+        // prints (in ECHO_MODE_FULL, the core runner's default) and
+        // accumulates, and saveEcho() persists the accumulated text to the
+        // LogMessage table under JOB_NAME so outcomes show up in the admin
+        // cron screen instead of only on stdout.
         foreach ((new MonthlyRun())->runFor(new \DateTimeImmutable('today')) as $idempresa => $line) {
-            echo '[' . $idempresa . '] ' . $line . PHP_EOL;
+            self::echo('[' . $idempresa . '] ' . $line . PHP_EOL);
         }
+        self::saveEcho();
     }
 }

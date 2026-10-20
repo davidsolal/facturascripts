@@ -12,11 +12,21 @@ require FS_FOLDER . '/vendor/autoload.php';
 
 \FacturaScripts\Core\Kernel::init();
 
-$force = in_array('--force', $argv, true);
-$arg = end($argv);
-$date = preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)$arg) === 1
-    ? new \DateTimeImmutable((string)$arg)
-    : new \DateTimeImmutable('today');
+// Order-independent: walk every arg after the script name so
+// `run.php --force 2026-09-19` and `run.php 2026-09-19 --force` behave the
+// same; the previous end($argv) lookup silently dropped the date whenever
+// --force came last. Unknown tokens are ignored.
+$force = false;
+$date = new \DateTimeImmutable('today');
+foreach (array_slice($argv, 1) as $token) {
+    if ($token === '--force') {
+        $force = true;
+        continue;
+    }
+    if (preg_match('/^\d{4}-\d{2}-\d{2}$/', $token) === 1) {
+        $date = new \DateTimeImmutable($token);
+    }
+}
 
 foreach ((new \FacturaScripts\Plugins\ZasadyBilling\Lib\MonthlyRun())->runFor($date, $force) as $id => $line) {
     echo '[' . $id . '] ' . $line . PHP_EOL;
