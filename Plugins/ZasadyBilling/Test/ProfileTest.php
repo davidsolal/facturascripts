@@ -24,4 +24,22 @@ final class ProfileTest extends TestCase
         $this->assertSame(5000.0, $p->amount);
         $this->assertSame(1.146, $p->rateOverride);
     }
+
+    public function testDefaultsMapYieldsDefaultDay(): void
+    {
+        $p = Profile::fromArray(2, Profile::defaults());
+        $this->assertSame(19, $p->day);
+    }
+
+    public function testEmptyStringDayFallsBackToDefault(): void
+    {
+        $p = Profile::fromArray(2, ['day' => '']);
+        $this->assertSame(19, $p->day);
+    }
+
+    public function testExplicitStoredDayWins(): void
+    {
+        $p = Profile::fromArray(2, ['day' => '25']);
+        $this->assertSame(25, $p->day);
+    }
 }

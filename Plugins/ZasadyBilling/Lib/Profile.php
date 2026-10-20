@@ -27,6 +27,26 @@ final class Profile
         return 'zasady-' . $idempresa;
     }
 
+    /**
+     * Per-key string defaults, as stored in/returned from the settings
+     * table. Used both as Tools::settings() fallback in load() and as a
+     * ready-made "nothing configured" raw array for callers/tests.
+     *
+     * @return array<string,string>
+     */
+    public static function defaults(): array
+    {
+        return [
+            'enabled' => '0',
+            'codserie' => '',
+            'codcliente' => '',
+            'amount' => '0',
+            'day' => '19',
+            'rate_override' => '0',
+            'description' => '',
+        ];
+    }
+
     public static function fromArray(int $idempresa, array $raw): self
     {
         $p = new self();
@@ -34,9 +54,16 @@ final class Profile
         $p->enabled = ($raw['enabled'] ?? '0') === '1';
         $p->codserie = (string)($raw['codserie'] ?? '');
         $p->codcliente = (string)($raw['codcliente'] ?? '');
-        $p->amount = (float)($raw['amount'] ?? 0);
-        $p->day = (int)($raw['day'] ?? 19);
-        $p->rateOverride = (float)($raw['rate_override'] ?? 0);
+        // Numeric fields: an empty string is a stored-but-unset value (e.g.
+        // Tools::settings() returning its default verbatim), not a real
+        // "0". Treat '' the same as missing so fromArray() falls back to
+        // the type default below instead of casting '' to 0/0.0.
+        $amountRaw = $raw['amount'] ?? null;
+        $p->amount = ($amountRaw === null || $amountRaw === '') ? 0.0 : (float)$amountRaw;
+        $dayRaw = $raw['day'] ?? null;
+        $p->day = ($dayRaw === null || $dayRaw === '') ? 19 : (int)$dayRaw;
+        $rateRaw = $raw['rate_override'] ?? null;
+        $p->rateOverride = ($rateRaw === null || $rateRaw === '') ? 0.0 : (float)$rateRaw;
         $p->description = (string)($raw['description'] ?? '');
         return $p;
     }
@@ -44,8 +71,9 @@ final class Profile
     public static function load(int $idempresa): self
     {
         $raw = [];
+        $defaults = self::defaults();
         foreach (self::keys() as $key) {
-            $raw[$key] = Tools::settings(self::group($idempresa), $key, '');
+            $raw[$key] = Tools::settings(self::group($idempresa), $key, $defaults[$key]);
         }
         return self::fromArray($idempresa, $raw);
     }
