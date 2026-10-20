@@ -40,6 +40,22 @@ final class MonthlyRun
             // uncaught \Throwable here would abort the sweep for every other
             // company (and every other plugin) behind it.
             try {
+                // Provision the exercise and its FacturaCliente sequence for
+                // this profile's series/date BEFORE anything else runs, so
+                // a brand-new year never reaches core's own silent
+                // auto-create (BusinessDocument::save() ->
+                // Ejercicio::loadFromDate(..., create:true), then
+                // BusinessDocumentCode::getSequence()'s default pattern) -
+                // see YearSetup's docblock for exactly what that loses.
+                // Skipped only when there is no series to provision for:
+                // IssuerGuard::check() below already reports that profile
+                // state as 'client or series missing', and creating a
+                // sequence keyed on an empty codserie would be a garbage
+                // row for a profile that was never going to issue anyway.
+                $codejercicio = $profile->codserie !== ''
+                    ? YearSetup::ensure($profile->idempresa, $profile->codserie, $date)
+                    : null;
+
                 // A manual override skips the ECB lookup entirely (and so
                 // can never be null); otherwise we trust EcbClient to
                 // return null when the published rate is missing or older
@@ -49,7 +65,7 @@ final class MonthlyRun
                     ? new Rate($profile->rateOverride, $date, Rate::SOURCE_MANUAL)
                     : (new EcbClient())->rateFor($date);
 
-                $blockers = IssuerGuard::check($profile, $rate, $date);
+                $blockers = IssuerGuard::check($profile, $rate, $date, $codejercicio);
                 if ($blockers !== []) {
                     $out[$profile->idempresa] = 'skipped: ' . implode('; ', $blockers);
                     continue;
