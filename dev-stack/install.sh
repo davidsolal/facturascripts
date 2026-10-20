@@ -65,6 +65,21 @@ else
     echo "✓ vendor/ present, skipped composer install"
 fi
 
+# ---------------------------------------------------------------- front-end assets
+# FacturaScripts serves Bootstrap, FontAwesome, jQuery and Pace straight out of
+# node_modules/ (git-ignored), so without this step the app works but renders
+# unstyled — every /node_modules/... request 404s.
+if [ ! -d "$ROOT/node_modules" ]; then
+    if command -v npm >/dev/null 2>&1; then
+        ( cd "$ROOT" && npm install --omit=dev --no-audit --no-fund )
+        echo "✓ npm assets installed (node_modules/)"
+    else
+        echo "! npm not found: the UI will render unstyled until 'npm install' runs in $ROOT" >&2
+    fi
+else
+    echo "✓ node_modules/ present, skipped npm install"
+fi
+
 # ---------------------------------------------------------------- app
 docker compose -f "$HERE/docker-compose.yml" --env-file "$ENV_FILE" up -d app
 for _ in $(seq 1 60); do
