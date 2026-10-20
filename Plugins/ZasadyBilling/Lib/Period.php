@@ -39,7 +39,12 @@ final class Period
 
     public static function markIssued(int $idempresa, string $isoDate, string $codigo): void
     {
-        Tools::settings(Profile::group($idempresa), self::settingsKey($isoDate), $codigo);
+        // settingsSet(), not settings(): Tools::settings() is a getter whose
+        // third argument is only a fallback for a missing key. Calling it here
+        // registered an empty 'issued-YYYY-MM' key and persisted nothing, so
+        // isIssued() stayed false forever and every run re-issued the invoice
+        // (same trap documented in Profile::save()).
+        Tools::settingsSet(Profile::group($idempresa), self::settingsKey($isoDate), $codigo);
         Tools::settingsSave();
     }
 
