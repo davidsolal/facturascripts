@@ -7,19 +7,22 @@
 // already issued invoice without opening the browser.
 //
 // Usage:
-//   php export-pdf.php <codigo> <output.pdf> [idempresa] [langcode]
+//   php export-pdf.php <codigo> <output.pdf> [idempresa]
 //
 // idempresa is optional but recommended: invoice codes are only unique per
 // company (both companies number their own F26 series from the same sequence
 // pattern), so a code that exists in two companies must be disambiguated.
-// langcode defaults to es_ES because that is the language of the invoices we
-// send; pass '' to fall back to the instance's configured language.
+//
+// The document language is not an argument: ZasadyExport pins it to
+// ZasadyExport::DOC_LANG (en_EN) so a French-UI instance can never print French
+// labels on a client document. See that class's DOC_LANG docblock.
 declare(strict_types=1);
 
 use FacturaScripts\Core\Kernel;
 use FacturaScripts\Core\Lib\ExportManager;
 use FacturaScripts\Core\Model\FacturaCliente;
 use FacturaScripts\Core\Where;
+use FacturaScripts\Plugins\ZasadyBilling\Lib\Export\ZasadyExport;
 
 define('FS_FOLDER', dirname(__DIR__, 2));
 require FS_FOLDER . '/config.php';
@@ -27,7 +30,7 @@ require FS_FOLDER . '/vendor/autoload.php';
 
 Kernel::init();
 
-$usage = 'usage: php export-pdf.php <codigo> <output.pdf> [idempresa] [langcode]' . PHP_EOL;
+$usage = 'usage: php export-pdf.php <codigo> <output.pdf> [idempresa]' . PHP_EOL;
 
 $codigo = $argv[1] ?? '';
 $output = $argv[2] ?? '';
@@ -36,7 +39,6 @@ if ($codigo === '' || $output === '') {
     exit(2);
 }
 $idempresa = (int)($argv[3] ?? 0);
-$langcode = $argv[4] ?? 'es_ES';
 
 // Locate the invoice. all() instead of load() because the primary key is
 // idfactura, not codigo, and because we want to *detect* an ambiguous code
@@ -72,7 +74,7 @@ $factura = $matches[0];
 // its return value must not be treated as a failure - the page is already in
 // the document by then.
 $export = new ExportManager();
-$export->newDoc('Zasady', $factura->codigo, 0, $langcode);
+$export->newDoc('Zasady', $factura->codigo, 0, ZasadyExport::DOC_LANG);
 $export->addBusinessDocPage($factura);
 $pdf = $export->getDoc();
 
@@ -98,6 +100,6 @@ printf(
     strlen($pdf),
     $factura->codigo,
     $factura->idempresa,
-    $langcode === '' ? 'instance language' : $langcode,
+    ZasadyExport::DOC_LANG,
     PHP_EOL
 );
