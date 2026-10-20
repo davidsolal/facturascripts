@@ -16,6 +16,20 @@ volume and leaves an already-installed `config.php` alone.
 
 Secrets live only in `dev-stack/.env`, which is git-ignored.
 
+## Access
+
+- Plain HTTP: `http://self0.tail7e037e.ts.net:8180` (the container publishes this)
+- HTTPS: `https://self0.tail7e037e.ts.net:8443` — Tailscale Serve terminates TLS with
+  a managed certificate and proxies to the container:
+
+```bash
+tailscale serve --bg --https=8443 http://<tailnet-ip>:8180
+```
+
+`install.sh` does not run this (it changes tailnet state, not the app). Disable with
+`tailscale serve --https=8443 off`. The certificate renews via Tailscale, so no cron
+job is needed — unlike mounting cert files into Apache, which would expire.
+
 ## Notes
 
 - **Bind address.** `FS_BIND_ADDR` in `.env` controls where port 8180 is
