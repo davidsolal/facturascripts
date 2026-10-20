@@ -56,6 +56,9 @@ class ZasadyExport extends PDFExport
      */
     private int $blocksPrinted = 0;
 
+    /** Readable title embedded in the PDF (set in addBusinessDocPage()). */
+    private string $documentTitle = '';
+
     /**
      * Forces the document language instead of accepting the caller's.
      *
@@ -86,6 +89,63 @@ class ZasadyExport extends PDFExport
 
         $this->blocksPrinted = 0;
         parent::newDoc($title, $idformat, self::DOC_LANG);
+    }
+
+    /**
+     * Names the file and the PDF title "<autonomo> - Invoice <code>", e.g.
+     * "Arlem Gomez - Invoice F2600010", so a downloaded invoice says who issued
+     * it before it is opened. Core names it after the page title (a generic
+     * "Facture client"), and the client gets a folder full of identical names.
+     *
+     * Applied only to the first document of an export: ExportBase::setFileName()
+     * is write-once, and a multi-invoice export has no single issuer to name.
+     */
+    public function addBusinessDocPage($model): bool
+    {
+        if ($this->pdf === null) {
+            $title = self::documentTitle((string)$this->issuerName((int)$model->idempresa), (string)$model->codigo);
+            $this->documentTitle = $title;
+        }
+
+        $result = parent::addBusinessDocPage($model);
+        if ($this->pdf !== null && $this->documentTitle !== '') {
+            // the file name has underscores for spaces; the embedded title is
+            // what PDF viewers show in the tab, so keep it readable
+            $this->pdf->addInfo('Title', $this->documentTitle);
+        }
+        return $result;
+    }
+
+    /**
+     * Download name. ExportBase::$fileName is private and write-once (core
+     * already filled it with the page title), so the name is overridden on the
+     * response instead. Quotes and path separators are stripped; spaces stay,
+     * which is what makes the file read "Arlem Gomez - Invoice F2600010.pdf".
+     */
+    public function show(\FacturaScripts\Core\Response &$response)
+    {
+        parent::show($response);
+        if ($this->documentTitle !== '') {
+            $safe = str_replace(['"', '/', '\\', "\r", "\n"], '', $this->documentTitle);
+            $response->headers->set('Content-Disposition', 'inline; filename="' . $safe . '.pdf"');
+        }
+    }
+
+    /**
+     * "<issuer> - Invoice <code>"; the issuer is dropped when unknown rather
+     * than printing an empty prefix.
+     */
+    public static function documentTitle(string $issuer, string $code): string
+    {
+        $issuer = trim($issuer);
+        $code = trim($code);
+        return ($issuer === '' ? '' : $issuer . ' - ') . 'Invoice' . ($code === '' ? '' : ' ' . $code);
+    }
+
+    private function issuerName(int $idempresa): string
+    {
+        $empresa = new Empresa();
+        return $idempresa > 0 && $empresa->load($idempresa) ? (string)$empresa->nombre : '';
     }
 
     /**
@@ -135,6 +195,91 @@ class ZasadyExport extends PDFExport
             ),
             self::FONT_SIZE
         );
+    }
+
+    /**
+     * True for a document in a currency other than EUR with a usable rate: the
+     * only case where the USD + EUR layout applies. EUR documents keep core's
+     * layout untouched.
+     */
+    private function isForeign($model): bool
+    {
+        return !empty($model->coddivisa) && $model->coddivisa !== 'EUR' && !empty($model->tasaconv);
+    }
+
+    /**
+     * "$3,000.00" / "EUR 2,572.90". English separators on purpose: the client
+     * document is pinned to en_EN (DOC_LANG), whereas Tools::number() follows
+     * the instance's French UI locale and would print "3 000,00".
+     */
+    public static function money(float $amount, string $currency): string
+    {
+        $symbols = ['USD' => '$', 'EUR' => "\u{20AC}"];
+        $symbol = $symbols[$currency] ?? $currency . ' ';
+        return ($amount < 0 ? '-' : '') . $symbol . number_format(abs($amount), 2, '.', ',');
+    }
+
+    /**
+     * Converts a face amount to EUR for display, with the document's own rate
+     * (totaleuros = total / tasaconv), so every EUR figure on the page ties to
+     * the amount accounting booked.
+     */
+    public static function toEur(float $amount, float $rate): float
+    {
+        return $rate > 0 ? round($amount / $rate, 2) : 0.0;
+    }
+
+    /**
+     * Line table with both currencies side by side (unit price and total in
+     * the document currency and in EUR), as in the invoices already sent to
+     * the client.
+     *
+     * @param object $model
+     */
+    public function insertBusinessDocBody($model)
+    {
+        if (false === $this->isForeign($model)) {
+            parent::insertBusinessDocBody($model);
+            return;
+        }
+
+        $cur = (string)$model->coddivisa;
+        $rate = (float)$model->tasaconv;
+        $headers = [
+            'description' => "Description / Descripci\u{00F3}n",
+            'unit_cur' => 'Unit price ' . $cur,
+            'unit_eur' => 'Unit price EUR',
+            'qty' => 'Quantity',
+            'total_cur' => 'Total ' . $cur,
+            'total_eur' => 'Total EUR',
+        ];
+        $rightAligned = ['justification' => 'right'];
+        $options = [
+            'cols' => [
+                'unit_cur' => $rightAligned, 'unit_eur' => $rightAligned, 'qty' => $rightAligned,
+                'total_cur' => $rightAligned, 'total_eur' => $rightAligned,
+            ],
+            'shadeCol' => [0.95, 0.95, 0.95],
+            'shadeHeadingCol' => [0.95, 0.95, 0.95],
+            'width' => $this->tableWidth,
+        ];
+
+        $rows = [];
+        foreach ($model->getLines() as $line) {
+            $rows[] = [
+                'description' => Tools::fixHtml(empty($line->referencia)
+                    ? $line->descripcion
+                    : $line->referencia . ' - ' . $line->descripcion),
+                'unit_cur' => self::money((float)$line->pvpunitario, $cur),
+                'unit_eur' => self::money(self::toEur((float)$line->pvpunitario, $rate), 'EUR'),
+                'qty' => rtrim(rtrim(number_format((float)$line->cantidad, 2, '.', ''), '0'), '.'),
+                'total_cur' => self::money((float)$line->pvptotal, $cur),
+                'total_eur' => self::money(self::toEur((float)$line->pvptotal, $rate), 'EUR'),
+            ];
+        }
+
+        $this->pdf->ezText("\n", 4);
+        $this->pdf->ezTable($rows, $headers, '', $options);
     }
 
     /**
@@ -202,6 +347,11 @@ class ZasadyExport extends PDFExport
      */
     public function insertBusinessDocFooter($model)
     {
+        if ($this->isForeign($model)) {
+            $this->insertForeignFooter($model);
+            return;
+        }
+
         // Core prints `observaciones` verbatim. Nothing writes the
         // machine-readable rate token there any more (it lives in Settings, see
         // Lib\RateToken), but invoices issued before that change still carry one
@@ -220,6 +370,83 @@ class ZasadyExport extends PDFExport
         $this->insertBankDetails((int)$model->idempresa);
         $this->insertPaymentTerms($model);
         $this->insertLegalFooter((int)$model->idempresa);
+    }
+
+    /**
+     * Footer of a foreign-currency invoice: observations, a totals table with
+     * a USD and a EUR column, the bilingual VAT statement, then payment terms,
+     * bank details and the legal line.
+     *
+     * Replaces core's footer instead of extending it: core's totals table is
+     * single-currency and prints the currency as the localized "DOLLAR
+     * AMERICAIN" and the receipt's payment method as the instance default
+     * ("Par defaut" on a French UI), neither of which belongs on a client
+     * document. Every number is still read from the model, never recomputed
+     * from scratch.
+     *
+     * @param object $model
+     */
+    private function insertForeignFooter($model): void
+    {
+        $cur = (string)$model->coddivisa;
+        $rate = (float)$model->tasaconv;
+
+        $this->insertTotals($model, $cur, $rate);
+        $this->insertBilingualTaxExceptions($model);
+
+        // The observation sentence is client-facing (rate, source, VAT basis);
+        // strip the legacy machine token exactly as the core path does.
+        $observations = trim((string)RateToken::strip($model->observaciones ?? null));
+        if ($observations !== '') {
+            $this->insertBlock(['Notes / Notas', Tools::fixHtml($observations)]);
+        }
+
+        $this->insertBankDetails((int)$model->idempresa);
+        $this->insertPaymentTerms($model);
+        $this->insertLegalFooter((int)$model->idempresa);
+    }
+
+    /**
+     * Subtotal, VAT and total in both currencies. The EUR total is the model's
+     * own totaleuros (what accounting booked); subtotal and VAT convert with
+     * the same rate.
+     *
+     * @param object $model
+     */
+    private function insertTotals($model, string $cur, float $rate): void
+    {
+        $hasVat = abs((float)$model->totaliva) > 0.004;
+        $rows = [
+            [
+                'label' => 'Subtotal',
+                'cur' => self::money((float)$model->neto, $cur),
+                'eur' => self::money(self::toEur((float)$model->neto, $rate), 'EUR'),
+            ],
+            [
+                'label' => 'VAT / IVA',
+                'cur' => $hasVat ? self::money((float)$model->totaliva, $cur) : 'Not applicable / No aplicable',
+                'eur' => $hasVat ? self::money(self::toEur((float)$model->totaliva, $rate), 'EUR') : '',
+            ],
+            [
+                'label' => '<b>Total</b>',
+                'cur' => '<b>' . self::money((float)$model->total, $cur) . '</b>',
+                'eur' => '<b>' . self::money(round((float)$model->totaleuros, 2), 'EUR') . '</b>',
+            ],
+        ];
+
+        $this->pdf->ezText("\n", 4);
+        $this->pdf->ezTable($rows, ['label' => '', 'cur' => $cur, 'eur' => 'EUR'], '', [
+            'cols' => [
+                'cur' => ['justification' => 'right'],
+                'eur' => ['justification' => 'right'],
+            ],
+            'shadeCol' => [0.95, 0.95, 0.95],
+            'shadeHeadingCol' => [0.95, 0.95, 0.95],
+            'xPos' => 'right',
+            'xOrientation' => 'left',
+            'width' => 300,
+        ]);
+        $this->blocksPrinted = 0;
     }
 
     /**
@@ -289,6 +516,7 @@ class ZasadyExport extends PDFExport
         // block at all, and the heading itself is emitted only together with at
         // least the IBAN (getCompanyBankAccount() guarantees it).
         $lines = ['Bank details / Datos bancarios'];
+        $lines[] = 'Payment method / Forma de pago: Bank transfer / Transferencia bancaria';
         $lines[] = 'IBAN: ' . $account->getIban(true);
         if (!empty($account->swift)) {
             $lines[] = 'BIC: ' . $account->swift;
