@@ -15,7 +15,16 @@ final class EcbClient
         $ch = curl_init($url);
         curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 20]);
         $body = curl_exec($ch);
-        if ($body === false || curl_getinfo($ch, CURLINFO_HTTP_CODE) !== 200) {
+        if ($body === false) {
+            \FacturaScripts\Core\Tools::log('cron')->warning(
+                'ECB rate fetch failed: ' . curl_error($ch)
+            );
+            curl_close($ch);
+            return null;
+        }
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+        if ($httpCode !== 200) {
             return null;
         }
         return self::parseCsv((string)$body, $isoDate);
@@ -63,7 +72,7 @@ final class EcbClient
         }
         $age = (new \DateTimeImmutable($limit->format('Y-m-d')))
             ->diff(new \DateTimeImmutable($best['date']))->days;
-        if ($age === false || $age > self::MAX_AGE_DAYS) {
+        if ($age > self::MAX_AGE_DAYS) {
             return null;
         }
         return new Rate($best['rate'], $best['date'], 'ecb');

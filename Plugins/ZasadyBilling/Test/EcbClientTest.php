@@ -26,6 +26,7 @@ final class EcbClientTest extends TestCase
     public function testWeekendFallsBackToPreviousPublication(): void
     {
         $r = EcbClient::parseCsv(self::CSV, '2026-09-19'); // Saturday
+        $this->assertNotNull($r);
         $this->assertSame('2026-09-18', $r->dateUsed);
         $this->assertSame(1.146, $r->usdPerEur);
     }
@@ -41,6 +42,19 @@ final class EcbClientTest extends TestCase
         $this->assertNotNull($r);
         $this->assertSame(1.1225, $r->usdPerEur);
         $this->assertSame('2026-10-19', $r->dateUsed);
+        $this->assertSame('ecb', $r->source);
+    }
+
+    // Header row present but missing TIME_PERIOD/OBS_VALUE names: exercises the
+    // array_search(...) === false fallback branch, which no other fixture reaches
+    // (the narrow and wide fixtures both happen to also work via name lookup).
+    public function testFallsBackToPositionalColumnsWhenHeaderNamesAreMissing(): void
+    {
+        $csv = "DATE,VALUE\n2026-09-18,1.146\n";
+        $r = EcbClient::parseCsv($csv, '2026-09-18');
+        $this->assertNotNull($r);
+        $this->assertSame(1.146, $r->usdPerEur);
+        $this->assertSame('2026-09-18', $r->dateUsed);
         $this->assertSame('ecb', $r->source);
     }
 }
