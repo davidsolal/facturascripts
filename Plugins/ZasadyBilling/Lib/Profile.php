@@ -88,7 +88,13 @@ final class Profile
         return $out;
     }
 
-    public function save(): void
+    /**
+     * Persists the profile and reports whether the settings table accepted the
+     * write. Callers that show "profile saved/enabled" must honour the return
+     * value: Tools::settingsSet() only fills an in-memory cache, so returning
+     * void here made a failed write look like success.
+     */
+    public function save(): bool
     {
         $group = self::group($this->idempresa);
         // Tools::settings() is a getter whose third argument is only a fallback
@@ -102,7 +108,7 @@ final class Profile
         Tools::settingsSet($group, 'day', (string)$this->day);
         Tools::settingsSet($group, 'rate_override', (string)$this->rateOverride);
         Tools::settingsSet($group, 'description', $this->description);
-        Tools::settingsSave();
+        return Tools::settingsSave();
     }
 
     public static function keys(): array

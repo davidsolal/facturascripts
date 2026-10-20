@@ -2,17 +2,26 @@
 // Plugins/ZasadyBilling/seed.php
 // Bootstraps a FacturaScripts instance with the two billing companies and the
 // configuration MonthlyRun()/Issuer() expect: shared invoice series, one
-// numbering sequence per company, the 0% "out of scope" tax, the client record
-// and both billing profiles.
+// numbering sequence per company, the 0% "out of scope" tax, one bank account
+// per company, the client record and both billing profiles.
 //
-// Every personal value (names, NIFs, addresses, amounts) is read from a private
-// JSON seed that never enters version control. This file only names the fields,
-// so the public fork can ship it as-is.
+// Every personal value (names, NIFs, addresses, IBANs, amounts) is read from a
+// private JSON seed that never enters version control. This file only names the
+// fields, so the public fork can ship it as-is.
 //
 // Run: docker exec facturascripts-app php /var/www/html/Plugins/ZasadyBilling/seed.php [--force]
 // Seed path: $ZASADY_SEED, or <FS_FOLDER>/dev-stack/private/billing-seed.json
-// --force: re-apply company/client/profile fields over existing values. Numbering
-//          sequences are never rewound, with or without the flag.
+//
+// Contract:
+//   (no flag) CREATE only what is missing. Existing rows - companies, series,
+//             bank accounts, profiles, the client and its address - are left
+//             exactly as the operator left them, and every skip is reported.
+//             Re-running is therefore safe after go-live.
+//   --force   Also rewrite those seed-derived fields over the existing rows.
+//   (both)    The numbering sequence is the one thing never rewritten: numero
+//             and inicio keep their value, so a re-run can neither renumber nor
+//             collide with invoices already issued. Only its usarhuecos flag is
+//             repaired, because that is a policy bit, not a counter.
 declare(strict_types=1);
 
 // The plugin directory sits inside the document root: refuse to run from a web
@@ -59,7 +68,8 @@ try {
     $companies = $seed['companies'] ?? [];
     $must(count($companies) > 0, 'seed contains no companies');
     $exerciseYear = (string)(int)($seed['exercise'] ?? date('Y'));
-    $billingDay = (int)($seed['billing_day'] ?? 19);
+    // Single source of truth for the billing day: Profile's own default.
+    $billingDay = (int)($seed['billing_day'] ?? \FacturaScripts\Plugins\ZasadyBilling\Lib\Profile::defaults()['day']);
     $lineName = (string)($seed['line'] ?? '');
 
     // Series are global (no idempresa column): both companies must share one
@@ -91,18 +101,24 @@ try {
         $must($diario->save(), 'create journal ' . $diarioName);
     }
 
-    // Invoice series, created once and then kept in sync with the seed.
+    // Invoice series: created once, then only touched by --force.
     $serie = new \FacturaScripts\Core\Model\Serie();
-    if (false === $serie->load($codserie)) {
-        $serie->codserie = $codserie;
+    $serieExists = $serie->load($codserie);
+    if (false === $serieExists || $force) {
+        if (false === $serieExists) {
+            $serie->codserie = $codserie;
+        }
+        $serie->descripcion = 'Facturas ' . $exerciseYear;
+        $serie->tipo = '';      // empty = ordinary series (R = rectificativa, S = simplificada)
+        $serie->siniva = false;
+        $serie->iddiario = (int)$diario->iddiario;
+        $must($serie->save(), 'save serie ' . $codserie);
     }
-    $serie->descripcion = 'Facturas ' . $exerciseYear;
-    $serie->tipo = '';          // empty = ordinary series (R = rectificativa, S = simplificada)
-    $serie->siniva = false;
-    $serie->iddiario = (int)$diario->iddiario;
-    $must($serie->save(), 'save serie ' . $codserie);
 
     $report = [];
+    $report[] = false === $serieExists
+        ? 'serie ' . $codserie . ' creada (diario ' . $diario->iddiario . ')'
+        : ($force ? 'serie ' . $codserie . ' actualizada' : 'serie ' . $codserie . ' sin cambios (--force la reescribe)');
     $profilesEnabled = 0;
 
     foreach ($companies as $c) {
@@ -110,27 +126,33 @@ try {
 
         // idempresa 1 already exists as the install wizard's placeholder
         // ("E-xxxx"), so load-then-fill updates it instead of adding a third
-        // company; idempresa 2 is created with an explicit id.
+        // company; idempresa 2 is created with an explicit id. Without --force
+        // an existing row is never written: an operator edit must survive a
+        // re-run.
         $empresa = new \FacturaScripts\Core\Model\Empresa();
-        if (false === $empresa->load($idempresa)) {
+        $empresaExists = $empresa->load($idempresa);
+        if (false === $empresaExists || $force) {
             $empresa->idempresa = $idempresa;
+            $empresa->nombre = (string)$c['name'];
+            $empresa->nombrecorto = mb_substr((string)$c['name'], 0, 32);
+            $empresa->cifnif = (string)$c['nif'];
+            $empresa->tipoidfiscal = 'NIF';
+            $empresa->personafisica = true;
+            $empresa->direccion = (string)$c['address'];
+            $empresa->codpostal = (string)$c['postcode'];
+            $empresa->ciudad = (string)$c['city'];
+            $empresa->provincia = (string)$c['province'];
+            $empresa->codpais = 'ESP';
+            $empresa->telefono1 = (string)($c['phone'] ?? '');
+            // EmailAndPhonesTrait::$email -> empresas.email (varchar 100);
+            // Empresa::test() rejects the row when it is not a valid address.
+            $empresa->email = (string)($c['email'] ?? '');
+            $empresa->web = $normalizeUrl($c['web'] ?? '');
+            $must($empresa->save(), 'save empresa ' . $idempresa);
+            $report[] = 'empresa ' . $idempresa . ($empresaExists ? ' actualizada' : ' creada');
+        } else {
+            $report[] = 'empresa ' . $idempresa . ' sin cambios (--force la reescribe)';
         }
-        $empresa->nombre = (string)$c['name'];
-        $empresa->nombrecorto = mb_substr((string)$c['name'], 0, 32);
-        $empresa->cifnif = (string)$c['nif'];
-        $empresa->tipoidfiscal = 'NIF';
-        $empresa->personafisica = true;
-        $empresa->direccion = (string)$c['address'];
-        $empresa->codpostal = (string)$c['postcode'];
-        $empresa->ciudad = (string)$c['city'];
-        $empresa->provincia = (string)$c['province'];
-        $empresa->codpais = 'ESP';
-        $empresa->telefono1 = (string)$c['phone'];
-        $empresa->web = $normalizeUrl($c['web'] ?? '');
-        // empresas has no email column in this schema, so the seed's company
-        // email is deliberately not written anywhere instead of being smuggled
-        // into a free-text field (invoice delivery uses the client contact).
-        $must($empresa->save(), 'save empresa ' . $idempresa);
 
         // Accounting exercise. Must come after the empresa row: ejercicios has a
         // FK to empresas (ca_ejercicios_empresas), so creating it first fails on
@@ -145,6 +167,14 @@ try {
             $ejercicio->loadFromDate($exerciseYear . '-01-15'),
             'exercise ' . $exerciseYear . ' for empresa ' . $idempresa
         );
+        if ($ejercicio->codejercicio !== $exerciseYear) {
+            // Not an error (core does this for the second company in a year, and
+            // it also opens a fresh alternative code when the year's exercise is
+            // closed), but it must be visible: the sequence is keyed by it.
+            $report[] = 'AVISO: ejercicio ' . $exerciseYear . ' de empresa ' . $idempresa
+                . ' vive bajo el codigo ' . $ejercicio->codejercicio
+                . ' (codejercicio es unico, no por empresa; o el ejercicio del ano esta cerrado)';
+        }
 
         // Numbering counter, one per company + series + exercise. Created with
         // the seed's next number, and never rewritten afterwards: a rerun after
@@ -163,8 +193,19 @@ try {
             \FacturaScripts\Core\Where::eq('tipodoc', 'FacturaCliente'),
         ];
         if ($seq->loadWhere($seqWhere)) {
+            $numero = $seq->numero;
+            if (false === (bool)$seq->usarhuecos) {
+                // Policy bit, not a counter: core sets true for FacturaCliente
+                // (BusinessDocumentCode / Wizard) and SecuenciaDocumento::test()
+                // logs use-holes-invoices-esp when it is false in Spain. With
+                // holes enabled a deleted invoice's number can be reused, so a
+                // mistake does not leave a permanent gap in a legal series.
+                $seq->usarhuecos = true;
+                $must($seq->save(), 'enable usarhuecos for empresa ' . $idempresa);
+                $must((int)$seq->numero === (int)$numero, 'sequence renumbered for empresa ' . $idempresa);
+            }
             $report[] = 'secuencia empresa ' . $idempresa . ' (' . $ejercicio->codejercicio . ') existente, numero '
-                . $seq->numero . ' intacto';
+                . $seq->numero . ' intacto, usarhuecos=' . ((bool)$seq->usarhuecos ? '1' : '0');
         } else {
             $seq->idempresa = $idempresa;
             $seq->codserie = $codserie;
@@ -175,18 +216,61 @@ try {
             $seq->longnumero = 5;
             $seq->inicio = (int)$c['next_number'];
             $seq->numero = (int)$c['next_number'];
-            $seq->usarhuecos = false;   // never reuse a gap in a legal invoice series
+            $seq->usarhuecos = true;    // see above: allow reusing a deleted number
             $must($seq->save(), 'create sequence for empresa ' . $idempresa);
             $report[] = 'secuencia empresa ' . $idempresa . ' (' . $ejercicio->codejercicio . ') creada, numero '
                 . $seq->numero;
         }
 
-        // Billing profile (settings-backed). Converge a missing or partial
-        // profile, but do not silently re-enable or re-price one the operator
-        // already tuned: re-running after pausing a company must not put it
-        // back on the billing calendar. --force is the explicit override.
+        // Bank account of the company itself. empresas has no IBAN column; the
+        // bank details the invoice PDF needs live in cuentasbanco, one row per
+        // company. codcuenta is that table's only key (numeric per
+        // CuentaBanco::test()), so it is derived from idempresa: stable across
+        // reruns, and a collision with another company's account is an error
+        // instead of a silent hijack.
+        $bankCode = (string)(1000 + $idempresa);
+        $iban = (string)preg_replace('/\s+/', '', (string)($c['iban'] ?? ''));
+        if ('' !== $iban) {
+            $cuenta = new \FacturaScripts\Core\Model\CuentaBanco();
+            $bankExists = $cuenta->load($bankCode);
+            if ($bankExists && (int)$cuenta->idempresa !== $idempresa) {
+                $must(false, 'cuenta banco ' . $bankCode . ' already belongs to empresa ' . $cuenta->idempresa);
+            }
+            if (false === $bankExists || $force) {
+                if (false === $bankExists) {
+                    $cuenta->codcuenta = $bankCode;
+                }
+                $cuenta->idempresa = $idempresa;
+                // cuentasbanco has no holder column: the account title is the
+                // description, and it is what tells the two accounts apart.
+                $holder = trim((string)($c['holder'] ?? ''));
+                $cuenta->descripcion = mb_substr('' === $holder ? (string)$c['name'] : $holder, 0, 100);
+                $cuenta->iban = $iban;
+                $cuenta->swift = trim((string)($c['bic'] ?? ''));
+                $cuenta->activa = true;
+                $must($cuenta->save(), 'save cuenta banco ' . $bankCode . ' for empresa ' . $idempresa);
+                $report[] = 'cuenta banco ' . $bankCode . ' empresa ' . $idempresa
+                    . ($bankExists ? ' actualizada' : ' creada');
+            } else {
+                $report[] = 'cuenta banco ' . $bankCode . ' empresa ' . $idempresa . ' sin cambios (--force la reescribe)';
+            }
+        }
+
+        // Billing profile (settings-backed). The stored properties are read
+        // before Profile::load(), because Tools::settings() registers the
+        // defaults for any missing key: after load() a key the operator never
+        // set is indistinguishable from one they set to Profile::defaults().
+        // Only a missing/empty amount means "not configured" - 0 is a value an
+        // operator may deliberately choose for a paused retainer.
+        $settings = new \FacturaScripts\Core\Model\Settings();
+        $stored = false === $settings->load(\FacturaScripts\Plugins\ZasadyBilling\Lib\Profile::group($idempresa))
+            ? []
+            : $settings->getProperties();
+
         $profile = \FacturaScripts\Plugins\ZasadyBilling\Lib\Profile::load($idempresa);
-        $configured = '' !== $profile->codcliente && 0.0 !== $profile->amount;
+        $configured = '' !== $profile->codserie
+            && '' !== $profile->codcliente
+            && '' !== trim((string)($stored['amount'] ?? ''));
         if (false === $configured || $force) {
             $profile->enabled = true;
             $profile->codserie = $codserie;
@@ -194,13 +278,17 @@ try {
             $profile->amount = (float)$c['amount'];
             $profile->day = $billingDay;
             $profile->description = $lineName;
-            $profile->save();
+            // Not a seed field: keep whatever rate the operator configured.
+            $must($profile->save(), 'persist billing profile for empresa ' . $idempresa);
+            $report[] = 'perfil empresa ' . $idempresa . ' aplicado (guardado confirmado)';
+        } else {
+            $report[] = 'perfil empresa ' . $idempresa . ' sin cambios (--force lo reescribe)';
         }
         if ($profile->enabled) {
             $profilesEnabled++;
         }
-        $report[] = 'perfil empresa ' . $idempresa . ' ' . ($configured && false === $force ? 'conservado' : 'aplicado')
-            . ', enabled=' . ($profile->enabled ? '1' : '0') . ', dia=' . $profile->day;
+        $report[] = 'perfil empresa ' . $idempresa . ' enabled=' . ($profile->enabled ? '1' : '0')
+            . ', dia=' . $profile->day;
     }
 
     // Client: out-of-scope services to a non-EU business. operacion MUST stay
@@ -211,54 +299,64 @@ try {
     $codcliente = (string)$clientSeed['code'];
     $taxId = trim((string)($clientSeed['tax_id'] ?? ''));
     $cliente = new \FacturaScripts\Core\Model\Cliente();
-    if (false === $cliente->load($codcliente)) {
+    $clientExists = $cliente->load($codcliente);
+    if (false === $clientExists || $force) {
         $cliente->codcliente = $codcliente;
+        $cliente->nombre = (string)$clientSeed['name'];
+        $cliente->razonsocial = (string)$clientSeed['name'];
+        $cliente->cifnif = $taxId;
+        $cliente->tipoidfiscal = '' === $taxId ? null : 'NIF';
+        $cliente->personafisica = false;
+        $cliente->telefono1 = (string)($clientSeed['phone'] ?? '');
+        $cliente->email = (string)($clientSeed['email'] ?? '');
+        $cliente->web = $normalizeUrl($clientSeed['web'] ?? '');
+        $cliente->operacion = '';   // see comment above: empty on purpose
+        $cliente->excepcioniva = \FacturaScripts\Core\Lib\TaxExceptions::ES_TAX_EXCEPTION_68_70;
+        $must($cliente->save(), 'save cliente ' . $codcliente);
+        $report[] = 'cliente ' . $codcliente . ($clientExists ? ' actualizado' : ' creado')
+            . ', operacion vacia, excepcion ' . \FacturaScripts\Core\Lib\TaxExceptions::ES_TAX_EXCEPTION_68_70;
+    } else {
+        $report[] = 'cliente ' . $codcliente . ' sin cambios (--force lo reescribe)';
     }
-    $cliente->nombre = (string)$clientSeed['name'];
-    $cliente->razonsocial = (string)$clientSeed['name'];
-    $cliente->cifnif = $taxId;
-    $cliente->tipoidfiscal = '' === $taxId ? null : 'NIF';
-    $cliente->personafisica = false;
-    $cliente->telefono1 = (string)($clientSeed['phone'] ?? '');
-    $cliente->email = (string)($clientSeed['email'] ?? '');
-    $cliente->web = $normalizeUrl($clientSeed['web'] ?? '');
-    $cliente->operacion = '';       // see comment above: empty on purpose
-    $cliente->excepcioniva = \FacturaScripts\Core\Lib\TaxExceptions::ES_TAX_EXCEPTION_68_70;
-    $must($cliente->save(), 'save cliente ' . $codcliente);
 
     // Cliente rows carry no address columns: the fiscal address lives on the
     // default Contacto (Cliente::saveInsert creates a bare one on insert) and
-    // that is what invoices copy onto the document header.
+    // that is what invoices copy onto the document header. A contact created by
+    // this run (or a client created by this run) is always filled; an existing
+    // pair is only rewritten by --force.
     $contacto = new \FacturaScripts\Core\Model\Contacto();
-    if (empty($cliente->idcontactofact) === false) {
+    if (false === empty($cliente->idcontactofact)) {
         $contacto->load((int)$cliente->idcontactofact);
     }
-    if (empty($contacto->idcontacto)) {
-        $contacto->codcliente = $cliente->codcliente;
-        $contacto->nombre = (string)$clientSeed['name'];
-        $contacto->descripcion = (string)$clientSeed['name'];
+    $contactExists = false === empty($contacto->idcontacto);
+    if (false === $contactExists || false === $clientExists || $force) {
+        if (false === $contactExists) {
+            $contacto->codcliente = $cliente->codcliente;
+            $contacto->nombre = (string)$clientSeed['name'];
+            $contacto->descripcion = (string)$clientSeed['name'];
+        }
+        $contacto->direccion = (string)$clientSeed['address'];
+        $contacto->codpostal = (string)$clientSeed['postcode'];
+        $contacto->ciudad = (string)$clientSeed['city'];
+        $contacto->provincia = (string)($clientSeed['region'] ?? '');
+        $contacto->codpais = (string)$clientSeed['country'];
+        $contacto->email = (string)($clientSeed['email'] ?? '');
+        $contacto->telefono1 = (string)($clientSeed['phone'] ?? '');
+        $must($contacto->save(), 'save client address');
+        $report[] = 'direccion cliente ' . $codcliente . ' guardada';
+    } else {
+        $report[] = 'direccion cliente ' . $codcliente . ' sin cambios (--force la reescribe)';
     }
-    $contacto->direccion = (string)$clientSeed['address'];
-    $contacto->codpostal = (string)$clientSeed['postcode'];
-    $contacto->ciudad = (string)$clientSeed['city'];
-    $contacto->provincia = (string)($clientSeed['region'] ?? '');
-    $contacto->codpais = (string)$clientSeed['country'];
-    $contacto->email = (string)($clientSeed['email'] ?? '');
-    $contacto->telefono1 = (string)($clientSeed['phone'] ?? '');
-    $must($contacto->save(), 'save client address');
     if ((int)$cliente->idcontactofact !== (int)$contacto->idcontacto) {
         $cliente->idcontactofact = (int)$contacto->idcontacto;
         $must($cliente->save(), 'link client billing address');
     }
 
-    $report[] = 'cliente ' . $codcliente . ' operacion vacia, excepcion '
-        . \FacturaScripts\Core\Lib\TaxExceptions::ES_TAX_EXCEPTION_68_70;
-
-    echo 'seed ok' . PHP_EOL;
+    echo 'seed ok (' . ($force ? 'force' : 'create-only') . ')' . PHP_EOL;
     echo '  empresas: ' . count($companies) . PHP_EOL;
     echo '  serie: ' . $codserie . ' (diario ' . $diario->iddiario . ')' . PHP_EOL;
     echo '  impuesto IVA0: presente' . PHP_EOL;
-    echo '  perfiles activos: ' . $profilesEnabled . PHP_EOL;
+    echo '  perfiles activos: ' . $profilesEnabled . ' de ' . count($companies) . PHP_EOL;
     foreach ($report as $entry) {
         echo '  - ' . $entry . PHP_EOL;
     }
