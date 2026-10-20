@@ -17,7 +17,10 @@ require FS_FOLDER . '/vendor/autoload.php';
 // same; the previous end($argv) lookup silently dropped the date whenever
 // --force came last. Unknown tokens are ignored.
 $force = false;
-$date = new \DateTimeImmutable('today');
+// Server-independent date: the container clock is UTC while the operator is
+// UTC+2, so "today" must be resolved in the billing timezone (Period::today()),
+// not from DateTimeImmutable('today') which follows PHP's UTC default.
+$date = \FacturaScripts\Plugins\ZasadyBilling\Lib\Period::today();
 foreach (array_slice($argv, 1) as $token) {
     if ($token === '--force') {
         $force = true;

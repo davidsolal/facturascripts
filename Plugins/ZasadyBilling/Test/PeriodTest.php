@@ -39,4 +39,22 @@ final class PeriodTest extends TestCase
         // 2028 is a leap year: February has 29 days.
         $this->assertSame('2028-02-29', Period::invoiceDate(2028, 2, 31));
     }
+
+    public function testMonthRangeCoversTheWholePeriodMonth(): void
+    {
+        // The idempotency guard looks for an invoice anywhere in the month, so
+        // a run on the 20th still sees the invoice issued on the 19th.
+        $this->assertSame('2026-09-01', Period::monthStart('2026-09-19'));
+        $this->assertSame('2026-09-30', Period::monthEnd('2026-09-19'));
+        $this->assertSame('2026-02-28', Period::monthEnd('2026-02-19'));
+        $this->assertSame('2028-02-29', Period::monthEnd('2028-02-19'));
+    }
+
+    public function testTodayIsResolvedInTheBillingTimezone(): void
+    {
+        // The container clock is UTC; the operator's day is Europe/Madrid. A
+        // UTC "today" made the cron miss its billing day around midnight.
+        $this->assertSame('Europe/Madrid', Period::today()->getTimezone()->getName());
+        $this->assertSame('00:00:00', Period::today()->format('H:i:s'));
+    }
 }

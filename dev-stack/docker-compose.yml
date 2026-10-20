@@ -30,6 +30,13 @@ services:
       FS_INITIAL_PASS: ${FS_INITIAL_PASS:?missing FS_INITIAL_PASS in dev-stack/.env}
       FS_LANG: ${FS_LANG:-fr_FR}
       FS_DEBUG: "false"
+      # Billing timezone. PHP has no date.timezone set in this image, so it
+      # falls back to the TZ variable; without it the container runs UTC and the
+      # monthly job's "today" is two hours behind the operator's (a run just
+      # after midnight CEST would still see yesterday, and the 19th would be
+      # missed). Also set explicitly in Period::today() for code paths that do
+      # not inherit the container environment.
+      TZ: Europe/Madrid
     dns:
       - 8.8.8.8   # Tailscale DNS is hijacked for containers, see skill docker-tailscale-dns
     depends_on:

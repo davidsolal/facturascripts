@@ -18,11 +18,15 @@ final class MonthlyRun
     {
         $out = [];
         foreach (Profile::all() as $profile) {
-            // Only the configured billing day triggers a run, unless the
-            // caller forces it (used by run.php for tests/backfills on an
-            // arbitrary date) - this is what keeps the cron idempotent
-            // against being invoked more than once a day.
-            if ((int)$today->format('j') !== $profile->day && false === $force) {
+            // Catch-up, not a single shot on one day: the run fires when the
+            // configured billing day has been reached, and the period marker
+            // (plus IssuerGuard's existing-invoice check) is what makes it
+            // idempotent. Requiring an exact day match meant that a failed or
+            // missed 19th was never retried, so the month was simply lost.
+            // The invoice date below is still the configured billing day of
+            // the current month, never "today", so a late run cannot produce a
+            // future-dated invoice.
+            if ((int)$today->format('j') < $profile->day && false === $force) {
                 continue;
             }
 
@@ -42,7 +46,7 @@ final class MonthlyRun
                 // than it allows, which IssuerGuard::check() below turns
                 // into a blocker.
                 $rate = $profile->rateOverride > 0
-                    ? new Rate($profile->rateOverride, $date, 'manual')
+                    ? new Rate($profile->rateOverride, $date, Rate::SOURCE_MANUAL)
                     : (new EcbClient())->rateFor($date);
 
                 $blockers = IssuerGuard::check($profile, $rate, $date);
@@ -53,11 +57,12 @@ final class MonthlyRun
 
                 $result = (new Issuer())->issue($profile, $rate, $date);
                 $out[$profile->idempresa] = sprintf(
-                    'issued %s (EUR %.2f, rate %s of %s)',
+                    'issued %s (EUR %.2f, rate %s of %s)%s',
                     $result['codigo'],
                     $result['totaleuros'],
                     $rate->usdPerEur,
-                    $rate->dateUsed
+                    $rate->dateUsed,
+                    self::rateDateWarning($rate, $date)
                 );
             } catch (\Throwable $e) {
                 // Never let one company's failure (bad series, missing tax,
@@ -68,5 +73,31 @@ final class MonthlyRun
             }
         }
         return $out;
+    }
+
+    /**
+     * Warns when a TARGET business day was invoiced with an older rate.
+     *
+     * The spec allows the previous publication only for days without one
+     * (weekend or TARGET holiday). On a business day the ECB did publish, so a
+     * different dateUsed means the lookup ran before publication or the feed
+     * was incomplete: the invoice is still issued (it is already correct enough
+     * to be legal, and blocking would lose the month again) but the operator
+     * must see it.
+     *
+     * Static and public so the rule can be unit-tested without a database: the
+     * sweep itself needs one, this decision does not.
+     */
+    public static function rateDateWarning(Rate $rate, string $invoiceDate): string
+    {
+        if ($rate->dateUsed === $invoiceDate || false === TargetCalendar::isBusinessDay($invoiceDate)) {
+            return '';
+        }
+
+        return sprintf(
+            ' | WARNING: no rate for %s, a TARGET business day; used the publication of %s',
+            $invoiceDate,
+            $rate->dateUsed
+        );
     }
 }

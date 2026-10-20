@@ -70,7 +70,10 @@ final class Issuer
         $factura->coddivisa = 'USD';
         $factura->tasaconv = $rate->usdPerEur;
         $factura->fecha = $isoDate;
-        $factura->fechadevengo = Period::dueDate($isoDate);
+        // Month-end terms: fechadevengo is the document's due date and the one
+        // the receipts are aligned to below.
+        $dueDate = Period::dueDate($isoDate);
+        $factura->fechadevengo = $dueDate;
 
         // Payment method, resolved against the issuing company: core refuses a
         // null codpago, and the client record cannot carry a single valid code
@@ -91,8 +94,23 @@ final class Issuer
         // which core only allows when operacion is EMPTY. Setting
         // 'exportacion' here would mismatch the line's exception and make
         // the client record unsavable.
-        $factura->observaciones = 'ECB rate ' . $rate->dateUsed . ' (1 EUR = ' . $rate->usdPerEur
-            . ' USD). Out of scope of Spanish VAT under arts. 68-70 LIVA (services to a non-EU business).';
+        // The observation sentence is client-facing and must state what was
+        // actually used: the ECB publication date (not the invoice date - they
+        // differ whenever the invoice date is a weekend or TARGET holiday) and
+        // whether the operator overrode it. RateToken appends the same two
+        // values in machine-readable form for Lib\Export\ZasadyExport; that
+        // token is stripped again before the observations are printed.
+        $factura->observaciones = RateToken::embed(
+            sprintf(
+                '%s (1 EUR = %s USD). Out of scope of Spanish VAT under arts. 68-70 LIVA '
+                . '(services to a non-EU business).',
+                $rate->source === Rate::SOURCE_MANUAL
+                    ? 'Manual rate'
+                    : RateToken::sourceLabel($rate->source) . ' of ' . $rate->dateUsed,
+                Tools::number($rate->usdPerEur, 4)
+            ),
+            $rate
+        );
         if (false === $factura->save()) {
             throw new \RuntimeException('invoice save failed for company ' . $p->idempresa);
         }
@@ -124,6 +142,18 @@ final class Issuer
             throw new \RuntimeException('invoice totals/save failed for company ' . $p->idempresa);
         }
 
+        // Core creates each receipt (in that same calculate() pass, via
+        // ReceiptGenerator) with vencimiento derived from formaspago's
+        // plazovencimiento, i.e. "+N days" or "+N months" from the invoice
+        // date. That cannot express "month-end": the acceptance run got
+        // 19-10-2026 for company 1 (TRANS, +1 month) and 19-09-2026 for
+        // company 2 (+0 days) on invoices dated 19-09-2026 - two different,
+        // both wrong due dates for the same contractual term. The document's
+        // fechadevengo IS the due date, and PDFDocument prints the receipt's
+        // vencimiento (never fechadevengo), so the receipts are realigned to
+        // it here, before the invoice becomes non-editable.
+        $this->alignReceiptsToDueDate($factura, $dueDate);
+
         // Core creates every invoice in the company's default status, which for
         // FacturaCliente is the draft ("Brouillon"/"Boceto"). A draft is not an
         // invoice: PDFExport prints a red "this invoice is still a sketch" banner
@@ -149,7 +179,17 @@ final class Issuer
             throw new \RuntimeException('invoice reload failed for company ' . $p->idempresa . ' after save');
         }
 
-        Period::markIssued($p->idempresa, $isoDate, $factura->codigo);
+        if (false === Period::markIssued($p->idempresa, $isoDate, $factura->codigo)) {
+            // The invoice exists and is non-editable: it cannot be rolled back,
+            // and reporting success here would hide a period that the marker
+            // does not protect. Fail loudly. IssuerGuard's existing-invoice
+            // check (belt and braces, independent of this marker) is what stops
+            // the next run from issuing a duplicate.
+            throw new \RuntimeException(
+                'invoice ' . $factura->codigo . ' was issued but the period marker '
+                . Period::key($p->idempresa, $isoDate) . ' could not be saved; do not re-run blindly'
+            );
+        }
 
         return [
             'codigo' => $factura->codigo,
@@ -158,6 +198,43 @@ final class Issuer
             // exercise/diary configured yet - that is not an error here.
             'idasiento' => (int)$factura->idasiento,
         ];
+    }
+
+    /**
+     * Sets every receipt of the invoice to the document's own due date.
+     *
+     * Core cannot express "month-end" in formaspago (only +N days / +N
+     * months), so the receipt date core derives is wrong for this contract and
+     * visible to the client: PDFDocument::insertInvoiceReceipts() prints
+     * `recibo->vencimiento` and nothing prints `fechadevengo`. Aligning the
+     * receipts is therefore the only way the printed due date can be the legal
+     * one.
+     *
+     * The amount, numbering and currency are left untouched: this is a date
+     * correction on an invoice that has not been sent yet, not a re-issue.
+     */
+    private function alignReceiptsToDueDate(FacturaCliente $factura, string $dueDate): void
+    {
+        $target = strtotime($dueDate);
+        foreach ($factura->getReceipts() as $receipt) {
+            if (strtotime((string)$receipt->vencimiento) === $target) {
+                continue;
+            }
+
+            $receipt->vencimiento = $dueDate;
+            // Receipt::save() calls updateInvoice() -> ReceiptGenerator, which
+            // recomputes the receipt set from the invoice total. That is
+            // unnecessary here and could regenerate a receipt with the old
+            // formaspago date; the generator disables the same hook when it
+            // creates receipts itself.
+            $receipt->disableInvoiceUpdate(true);
+            if (false === $receipt->save()) {
+                throw new \RuntimeException(
+                    'could not set due date ' . $dueDate . ' on receipt ' . $receipt->numero
+                    . ' of invoice ' . $factura->codigo
+                );
+            }
+        }
     }
 
     /**

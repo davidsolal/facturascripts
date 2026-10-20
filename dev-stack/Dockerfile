@@ -39,4 +39,12 @@ RUN printf '%s\n' \
     && sed -ri 's/^: \$\{APACHE_RUN_USER:=www-data\}$/: ${APACHE_RUN_USER:=#1000}/; s/^: \$\{APACHE_RUN_GROUP:=www-data\}$/: ${APACHE_RUN_GROUP:=#1000}/' /etc/apache2/envvars \
     && grep -E 'APACHE_RUN_(USER|GROUP):=' /etc/apache2/envvars
 
+# PHP's default timezone, because PHP does NOT read the container's TZ variable
+# for date_default_timezone_get(): without this the process clocks stay UTC while
+# the operator (and the client's payment terms) are in Spain, and the monthly
+# billing job's "today" can be the previous day. dev-stack/docker-compose.yml
+# also sets TZ=Europe/Madrid for the parts that do honour it, and
+# Lib\Period::today() pins it in code for the billing calendar itself.
+RUN printf '%s\n' 'date.timezone = Europe/Madrid' > /usr/local/etc/php/conf.d/timezone.ini
+
 WORKDIR /var/www/html

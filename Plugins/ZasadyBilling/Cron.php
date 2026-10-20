@@ -4,6 +4,7 @@ namespace FacturaScripts\Plugins\ZasadyBilling;
 
 use FacturaScripts\Core\Template\CronJobClass;
 use FacturaScripts\Plugins\ZasadyBilling\Lib\MonthlyRun;
+use FacturaScripts\Plugins\ZasadyBilling\Lib\Period;
 
 /**
  * Cron entry point core discovers and calls as `(new Cron($pluginName))->run()`.
@@ -26,7 +27,7 @@ final class Cron extends CronJobClass
         // accumulates, and saveEcho() persists the accumulated text to the
         // LogMessage table under JOB_NAME so outcomes show up in the admin
         // cron screen instead of only on stdout.
-        foreach ((new MonthlyRun())->runFor(new \DateTimeImmutable('today')) as $idempresa => $line) {
+        foreach ((new MonthlyRun())->runFor(Period::today()) as $idempresa => $line) {
             self::echo('[' . $idempresa . '] ' . $line . PHP_EOL);
         }
         self::saveEcho();

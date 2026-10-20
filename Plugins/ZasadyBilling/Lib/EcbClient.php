@@ -75,6 +75,6 @@ final class EcbClient
         if ($age > self::MAX_AGE_DAYS) {
             return null;
         }
-        return new Rate($best['rate'], $best['date'], 'ecb');
+        return new Rate($best['rate'], $best['date'], Rate::SOURCE_ECB);
     }
 }
