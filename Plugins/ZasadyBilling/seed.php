@@ -311,6 +311,9 @@ try {
         $cliente->email = (string)($clientSeed['email'] ?? '');
         $cliente->web = $normalizeUrl($clientSeed['web'] ?? '');
         $cliente->operacion = '';   // see comment above: empty on purpose
+        // Document language pair is a property of the client: 'en_EN' prints EN/ES,
+        // 'fr_FR' prints FR/ES (ZasadyExport::primaryLanguage). Unset = EN/ES.
+        $cliente->langcode = ($clientSeed['langcode'] ?? '') !== '' ? (string)$clientSeed['langcode'] : 'en_EN';
         $cliente->excepcioniva = \FacturaScripts\Core\Lib\TaxExceptions::ES_TAX_EXCEPTION_68_70;
         $must($cliente->save(), 'save cliente ' . $codcliente);
         $report[] = 'cliente ' . $codcliente . ($clientExists ? ' actualizado' : ' creado')

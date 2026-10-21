@@ -2,125 +2,202 @@
 
 namespace FacturaScripts\Plugins\ZasadyBilling\Lib\Export;
 
+use DateTimeImmutable;
 use FacturaScripts\Core\Lib\Export\PDFExport;
 use FacturaScripts\Core\Lib\TaxExceptions;
 use FacturaScripts\Core\Model\CuentaBanco;
 use FacturaScripts\Core\Model\Empresa;
+use FacturaScripts\Core\Model\Pais;
 use FacturaScripts\Core\Tools;
+use FacturaScripts\Plugins\ZasadyBilling\Lib\Rate;
 use FacturaScripts\Plugins\ZasadyBilling\Lib\RateToken;
 
 /**
- * Bilingual (EN/ES) invoice export. Renders the stock FacturaScripts PDF and
- * adds, in this order: a rate line under the header stating the rate, the date
- * it was published and its source; a bilingual VAT-exception statement; the
- * issuing company's bank details; the payment-terms line with the real due
- * date; and the legal footer ("<name> - autonomo - <email>").
+ * Bilingual client invoice: the client's language + Spanish.
  *
- * It does NOT recompute any figure: every number is read verbatim from the
- * model (tasaconv, totaleuros, fechadevengo). totaleuros is set once by
- * BusinessDocument::total/tasaconv at save time, and reprinting with a
- * different rounding would make the PDF disagree with what accounting booked.
+ * The language pair belongs to the CLIENT, not to the export: it is read from
+ * the Language field of the customer record (clientes.langcode). A client in
+ * French prints French + Spanish; everything else - including a client with no
+ * language set, as the Zasady record has - prints English + Spanish. Spanish is
+ * always the second language because the issuers are Spanish autonomos and the
+ * Spanish wording is the legally relevant one.
  *
- * Extends PDFExport, not PDFDocument directly: PDFDocument
- * (Core/Lib/PDF/PDFDocument.php) is declared abstract and never implements
- * ExportBase's addBusinessDocPage/getDoc/newDoc/show/etc — only PDFExport
- * does. PDFExport::addBusinessDocPage() calls the insert*BusinessDoc* hooks on
- * the (non-final) instance, so overriding them here still takes effect via
- * normal PHP dispatch while we inherit a concrete, instantiable export class.
+ * The page is drawn from scratch (header band, meta strip, party cards, a line
+ * table with the document currency and its EUR equivalent stacked in each price
+ * cell, a totals card, payment panel, footer) instead of decorating core's PDF,
+ * whose layout is single-currency and takes its labels from the instance UI.
  *
- * Deliberately not final: the Dinamic shim written by dev-stack/install.sh
- * (FacturaScripts\Dinamic\Lib\Export\ZasadyExport) must extend this class —
- * that is how ExportManager::getExportClassName() finds it — so `final` would
- * break class resolution with a fatal error.
+ * No figure accounting booked is recomputed: totals are read from the model
+ * (neto, totaliva, total, totaleuros, tasaconv). Only per-line EUR display
+ * values are derived, with the document's own rate.
+ *
+ * Extends PDFExport so ExportManager / the Dinamic shim written by
+ * dev-stack/install.sh still resolve it; deliberately not final for that shim.
  */
 class ZasadyExport extends PDFExport
 {
     /**
-     * Language of the rendered client document, pinned regardless of the
-     * instance's FS_LANG or the langcode passed by the caller.
-     *
-     * The instance UI runs in French; without pinning, every core label
-     * ("Facture", "Virement bancaire", "Exceptions fiscales") leaked into a
-     * document sent to a US client. English is the client's language and the
-     * Spanish legal wording is printed explicitly next to it (VAT statement,
-     * rate, terms, bank labels), so the document is EN + ES while the core
-     * chrome stays English. This is the export-path enforcement of spec §7's
-     * "never print a French invoice to a US client".
+     * Language pinned for core's own chrome. Nothing client-facing uses it any
+     * more (labels come from LABELS), but newDoc() must not inherit the
+     * instance's French UI.
      */
     public const DOC_LANG = 'en_EN';
 
-    /**
-     * How many of our own blocks have already been written on the current
-     * render, used to add the separating blank line once instead of before
-     * every block. Reset per document in newDoc().
-     */
-    private int $blocksPrinted = 0;
+    /** Primary language used when the client has none. */
+    public const DEFAULT_LANG = 'en_EN';
+
+    /** [en, fr, es] */
+    private const LABELS = [
+        'invoice' => ['Invoice', 'Facture', 'Factura'],
+        'date' => ['Invoice date', 'Date de facture', 'Fecha de factura'],
+        'due' => ['Due date', 'Échéance', 'Vencimiento'],
+        'rate' => ['Exchange rate', 'Taux de change', 'Tipo de cambio'],
+        'from' => ['From', 'Émetteur', 'Emisor'],
+        'billto' => ['Bill to', 'Facturé à', 'Cliente'],
+        'description' => ['Description', 'Description', 'Descripción'],
+        'qty' => ['Qty', 'Qté', 'Cant.'],
+        'unit' => ['Unit price', 'Prix unitaire', 'Precio unitario'],
+        'amount' => ['Amount', 'Montant', 'Importe'],
+        'subtotal' => ['Subtotal', 'Sous-total', 'Subtotal'],
+        'vat' => ['VAT', 'TVA', 'IVA'],
+        'total' => ['Total', 'Total', 'Total'],
+        'na' => ['Not applicable', 'Non applicable', 'No aplicable'],
+        'method' => ['Payment method', 'Mode de paiement', 'Forma de pago'],
+        'transfer' => ['Bank transfer', 'Virement bancaire', 'Transferencia bancaria'],
+        'terms' => ['Payment terms', 'Conditions de paiement', 'Condiciones de pago'],
+        'monthend' => ['Month-end', 'Fin de mois', 'Fin de mes'],
+        'holder' => ['Account holder', 'Titulaire du compte', 'Titular'],
+        'notes' => ['Notes', 'Notes', 'Notas'],
+        'vatnote' => ['VAT treatment', 'Régime de TVA', 'Tratamiento del IVA'],
+        'autonomo' => ['Self-employed', 'Indépendant', 'Autónomo'],
+        'bank' => ['Bank details', 'Coordonnées bancaires', 'Datos bancarios'],
+    ];
+
+    private const MONTHS = [
+        'en_EN' => ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'],
+        'fr_FR' => ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'],
+    ];
+
+    private const MARGIN = 40;
+
+    // palette (0-1 RGB)
+    private const INK = [0.09, 0.10, 0.16];
+    private const MUTED = [0.30, 0.32, 0.40];
+    private const FAINT = [0.45, 0.47, 0.55];
+    private const LINE = [0.89, 0.90, 0.93];
+    private const CARD = [0.965, 0.970, 0.985];
+    private const NAVY = [0.06, 0.08, 0.19];
+    private const ACCENT = [0.31, 0.33, 0.93];
+    private const ACCENT_SOFT = [0.72, 0.75, 1.0];
+    private const WHITE = [1.0, 1.0, 1.0];
 
     /** Readable title embedded in the PDF (set in addBusinessDocPage()). */
     private string $documentTitle = '';
 
+    /** Primary language of the document being drawn. */
+    private string $lang = self::DEFAULT_LANG;
+
+    /** Current drawing cursor, PDF coordinates (origin bottom-left). */
+    private float $cy = 0.0;
+
+    // ------------------------------------------------------------------
+    // Language
+    // ------------------------------------------------------------------
+
     /**
-     * Forces the document language instead of accepting the caller's.
-     *
-     * newDoc() is the only place PDFCore's Translator is told which language to
-     * use (PDFExport::newDoc() -> $this->i18n->setLang()), so overriding it here
-     * is what makes DOC_LANG actually apply to header, table, totals, receipts
-     * and footer translations at once. The $langcode argument is kept for
-     * signature compatibility with ExportBase and deliberately ignored.
+     * Primary language for a client language code: French for any fr_*,
+     * English for everything else (empty, en_*, or a language with no label
+     * set yet). Spanish is implicit as the second language.
      */
+    public static function primaryLanguage(?string $langcode): string
+    {
+        $code = strtolower(trim((string)$langcode));
+        return strncmp($code, 'fr', 2) === 0 ? 'fr_FR' : self::DEFAULT_LANG;
+    }
+
+    /** "EN/ES" or "FR/ES", for logs and docs. */
+    public static function pairLabel(?string $langcode): string
+    {
+        return strtoupper(substr(self::primaryLanguage($langcode), 0, 2)) . '/ES';
+    }
+
+    /** @return string[] [document language, Spanish] */
+    private function labels(string $key): array
+    {
+        $row = self::LABELS[$key];
+        return [$row[$this->lang === 'fr_FR' ? 1 : 0], $row[2]];
+    }
+
+    // ------------------------------------------------------------------
+    // Export plumbing
+    // ------------------------------------------------------------------
+
     public function newDoc(string $title, int $idformat, string $langcode)
     {
-        // PDFCore points Cezpdf's tempPath at MyFiles/Cache and Cpdf then writes
-        // its font metrics there; nothing creates that folder on a CLI run (only
-        // IPFilter does, on web requests), and core's PluginsDeploy wipes it. A
-        // missing folder made the export die with a TypeError inside Cpdf before
-        // the first line of the invoice was drawn.
-        //
-        // 0777 and an unconditional chmod because the two callers are different
-        // users: the CLI runs as root in this stack while Apache runs as uid
-        // 1000, so whichever one creates the folder first would otherwise lock
-        // the other out of the font cache. Core's IPFilter creates the same
-        // folder 0777 for exactly this reason.
+        // PDFCore points Cezpdf's tempPath at MyFiles/Cache and Cpdf writes its
+        // font metrics there; nothing creates that folder on a CLI run and
+        // core's PluginsDeploy wipes it. 0777 + unconditional chmod because the
+        // CLI (root) and Apache (uid 1000) both write to it.
         $cacheDir = FS_FOLDER . '/MyFiles/Cache';
         if (false === is_dir($cacheDir)) {
             @mkdir($cacheDir, 0777, true);
         }
         @chmod($cacheDir, 0777);
 
-        $this->blocksPrinted = 0;
         parent::newDoc($title, $idformat, self::DOC_LANG);
     }
 
     /**
-     * Names the file and the PDF title "<autonomo> - Invoice <code>", e.g.
-     * "Arlem Gomez - Invoice F2600010", so a downloaded invoice says who issued
-     * it before it is opened. Core names it after the page title (a generic
-     * "Facture client"), and the client gets a folder full of identical names.
-     *
-     * Applied only to the first document of an export: ExportBase::setFileName()
-     * is write-once, and a multi-invoice export has no single issuer to name.
+     * Draws the whole invoice. Replaces PDFExport::addBusinessDocPage() rather
+     * than hooking into it: the page is composed here, section by section.
      */
     public function addBusinessDocPage($model): bool
     {
         if ($this->pdf === null) {
-            $title = self::documentTitle((string)$this->issuerName((int)$model->idempresa), (string)$model->codigo);
-            $this->documentTitle = $title;
+            $this->documentTitle = self::documentTitle($this->issuerName((int)$model->idempresa), (string)$model->codigo);
         }
 
-        $result = parent::addBusinessDocPage($model);
-        if ($this->pdf !== null && $this->documentTitle !== '') {
-            // the file name has underscores for spaces; the embedded title is
-            // what PDF viewers show in the tab, so keep it readable
+        if (null === $this->format) {
+            $this->format = $this->getDocumentFormat($model);
+        }
+        if ($this->pdf === null) {
+            $this->newPage();
+        } else {
+            $this->pdf->ezNewPage();
+            $this->insertedHeader = false;
+        }
+        if ($this->documentTitle !== '') {
             $this->pdf->addInfo('Title', $this->documentTitle);
         }
-        return $result;
+
+        $client = $model->getSubject();
+        $this->lang = self::primaryLanguage($client->langcode ?? null);
+
+        $empresa = new Empresa();
+        $empresa->load((int)$model->idempresa);
+
+        $this->drawHeaderBand($model, $empresa);
+        $this->drawMetaStrip($model);
+        $this->drawParties($model, $empresa, $client);
+        $this->drawLines($model);
+        $this->drawTotals($model);
+        $this->drawPayment($model);
+        $this->drawFooter($empresa);
+
+        if (in_array($model->modelClassName(), ['FacturaCliente', 'FacturaProveedor']) && $model->editable) {
+            $this->pdf->setColor(200, 0, 0);
+            $this->pdf->addText(0, 230, 15, $this->i18n->trans('sketch-invoice-warning'), 600, 'center', -35);
+            $this->pdf->setColor(0, 0, 0);
+        }
+
+        // do not continue with export
+        return false;
     }
 
     /**
-     * Download name. ExportBase::$fileName is private and write-once (core
-     * already filled it with the page title), so the name is overridden on the
-     * response instead. Quotes and path separators are stripped; spaces stay,
-     * which is what makes the file read "Arlem Gomez - Invoice F2600010.pdf".
+     * Download name. ExportBase::$fileName is private and write-once, so the
+     * name is overridden on the response. Quotes and path separators are
+     * stripped; spaces stay: "Arlem Gomez - Invoice F2600010.pdf".
      */
     public function show(\FacturaScripts\Core\Response &$response)
     {
@@ -131,10 +208,7 @@ class ZasadyExport extends PDFExport
         }
     }
 
-    /**
-     * "<issuer> - Invoice <code>"; the issuer is dropped when unknown rather
-     * than printing an empty prefix.
-     */
+    /** "<issuer> - Invoice <code>"; the issuer is dropped when unknown. */
     public static function documentTitle(string $issuer, string $code): string
     {
         $issuer = trim($issuer);
@@ -148,318 +222,572 @@ class ZasadyExport extends PDFExport
         return $idempresa > 0 && $empresa->load($idempresa) ? (string)$empresa->nombre : '';
     }
 
-    /**
-     * Inserts the core header untouched, then our EUR/rate addendum.
-     *
-     * Declared public even though the parent method is protected: PHP allows
-     * widening visibility on override, and nothing outside the PDF export
-     * flow calls this directly, so the wider visibility has no effect on
-     * behaviour.
-     *
-     * @param object $model
-     */
-    public function insertBusinessDocHeader($model)
-    {
-        parent::insertBusinessDocHeader($model);
+    // ------------------------------------------------------------------
+    // Number / date formatting (static + pure, unit-tested)
+    // ------------------------------------------------------------------
 
-        // A document already in EUR has tasaconv = 1 and no conversion to
-        // show; skip the line rather than print a no-op "1 EUR = 1 EUR".
-        if (empty($model->tasaconv) || $model->coddivisa === 'EUR') {
-            return;
+    /**
+     * "$3,000.00" / "€2,674.99" in English, "3 000,00 $" / "2 674,99 €" in
+     * French. Separators follow the document language, not the instance's UI
+     * locale (Tools::number() would print the French UI's format on an English
+     * document).
+     */
+    public static function money(float $amount, string $currency, string $lang = 'en_EN'): string
+    {
+        $symbols = ['USD' => '$', 'EUR' => "\u{20AC}", 'GBP' => "\u{00A3}"];
+        $symbol = $symbols[$currency] ?? $currency;
+        $sign = $amount < 0 ? '-' : '';
+        $abs = abs($amount);
+
+        if ($lang === 'fr_FR') {
+            return $sign . number_format($abs, 2, ',', ' ') . ' ' . $symbol;
         }
-
-        // The date printed must be the date of the rate actually used, not the
-        // invoice date: the ECB publishes only on TARGET business days, so an
-        // invoice dated Saturday 19-09-2026 uses Friday's rate. Printing
-        // $model->fecha claimed the rate was from the 19th while the
-        // observations on the same page said the 18th.
-        //
-        // The metadata lives in Settings keyed by company + invoice code (see
-        // Lib\RateToken - never in observaciones, which core's stock PDF prints
-        // verbatim). An invoice issued before it was stored has no entry: the
-        // rate date then falls back to the invoice date, exactly as this line
-        // printed before the metadata existed, and the source is omitted
-        // because claiming one would be a guess.
-        $meta = $this->rateMeta($model);
-        $rateLine = null === $meta
-            ? $this->dateLabel($model->fecha)
-            : RateToken::sourceLabel($meta['source']) . ', ' . $this->dateLabel($meta['date']);
-
-        $this->pdf->ezText(
-            sprintf(
-                'Exchange rate / Tipo de cambio (%s): 1 EUR = %s %s     Total EUR / Total en EUR: %s EUR',
-                $rateLine,
-                Tools::number((float)$model->tasaconv, 4),
-                $model->coddivisa,
-                Tools::number((float)$model->totaleuros, 2)
-            ),
-            self::FONT_SIZE
-        );
-    }
-
-    /**
-     * True for a document in a currency other than EUR with a usable rate: the
-     * only case where the USD + EUR layout applies. EUR documents keep core's
-     * layout untouched.
-     */
-    private function isForeign($model): bool
-    {
-        return !empty($model->coddivisa) && $model->coddivisa !== 'EUR' && !empty($model->tasaconv);
-    }
-
-    /**
-     * "$3,000.00" / "EUR 2,572.90". English separators on purpose: the client
-     * document is pinned to en_EN (DOC_LANG), whereas Tools::number() follows
-     * the instance's French UI locale and would print "3 000,00".
-     */
-    public static function money(float $amount, string $currency): string
-    {
-        $symbols = ['USD' => '$', 'EUR' => "\u{20AC}"];
-        $symbol = $symbols[$currency] ?? $currency . ' ';
-        return ($amount < 0 ? '-' : '') . $symbol . number_format(abs($amount), 2, '.', ',');
+        $prefix = isset($symbols[$currency]) ? $symbol : $symbol . ' ';
+        return $sign . $prefix . number_format($abs, 2, '.', ',');
     }
 
     /**
      * Converts a face amount to EUR for display, with the document's own rate
-     * (totaleuros = total / tasaconv), so every EUR figure on the page ties to
-     * the amount accounting booked.
+     * (totaleuros = total / tasaconv), so every EUR figure ties to accounting.
      */
     public static function toEur(float $amount, float $rate): float
     {
         return $rate > 0 ? round($amount / $rate, 2) : 0.0;
     }
 
-    /**
-     * Line table with both currencies side by side (unit price and total in
-     * the document currency and in EUR), as in the invoices already sent to
-     * the client.
-     *
-     * @param object $model
-     */
-    public function insertBusinessDocBody($model)
+    /** "20 October 2026" / "20 octobre 2026"; unparseable input is returned as is. */
+    public static function longDate(?string $date, string $lang = 'en_EN'): string
     {
-        if (false === $this->isForeign($model)) {
-            parent::insertBusinessDocBody($model);
-            return;
+        $value = trim((string)$date);
+        if ($value === '') {
+            return '';
         }
-
-        $cur = (string)$model->coddivisa;
-        $rate = (float)$model->tasaconv;
-        $headers = [
-            'description' => "Description / Descripci\u{00F3}n",
-            'unit_cur' => 'Unit price ' . $cur,
-            'unit_eur' => 'Unit price EUR',
-            'qty' => 'Quantity',
-            'total_cur' => 'Total ' . $cur,
-            'total_eur' => 'Total EUR',
-        ];
-        $rightAligned = ['justification' => 'right'];
-        $options = [
-            'cols' => [
-                'unit_cur' => $rightAligned, 'unit_eur' => $rightAligned, 'qty' => $rightAligned,
-                'total_cur' => $rightAligned, 'total_eur' => $rightAligned,
-            ],
-            'shadeCol' => [0.95, 0.95, 0.95],
-            'shadeHeadingCol' => [0.95, 0.95, 0.95],
-            'width' => $this->tableWidth,
-        ];
-
-        $rows = [];
-        foreach ($model->getLines() as $line) {
-            $rows[] = [
-                'description' => Tools::fixHtml(empty($line->referencia)
-                    ? $line->descripcion
-                    : $line->referencia . ' - ' . $line->descripcion),
-                'unit_cur' => self::money((float)$line->pvpunitario, $cur),
-                'unit_eur' => self::money(self::toEur((float)$line->pvpunitario, $rate), 'EUR'),
-                'qty' => rtrim(rtrim(number_format((float)$line->cantidad, 2, '.', ''), '0'), '.'),
-                'total_cur' => self::money((float)$line->pvptotal, $cur),
-                'total_eur' => self::money(self::toEur((float)$line->pvptotal, $rate), 'EUR'),
-            ];
+        $parsed = null;
+        foreach (['Y-m-d', 'd-m-Y', 'Y-m-d H:i:s', 'd-m-Y H:i:s'] as $format) {
+            $candidate = DateTimeImmutable::createFromFormat('!' . $format, $value);
+            if ($candidate !== false && $candidate->format($format) === $value) {
+                $parsed = $candidate;
+                break;
+            }
         }
+        if (null === $parsed) {
+            return $value;
+        }
+        $months = self::MONTHS[$lang] ?? self::MONTHS['en_EN'];
+        $day = $lang === 'fr_FR' && (int)$parsed->format('j') === 1 ? '1er' : $parsed->format('j');
+        return $day . ' ' . $months[(int)$parsed->format('n') - 1] . ' ' . $parsed->format('Y');
+    }
 
-        $this->pdf->ezText("\n", 4);
-        $this->pdf->ezTable($rows, $headers, '', $options);
+    // ------------------------------------------------------------------
+    // Drawing primitives
+    // ------------------------------------------------------------------
+
+    private function contentWidth(): float
+    {
+        return $this->pdf->ez['pageWidth'] - 2 * self::MARGIN;
+    }
+
+    private function fill(float $x, float $y, float $w, float $h, array $rgb): void
+    {
+        $this->pdf->setColor($rgb[0], $rgb[1], $rgb[2], 1);
+        $this->pdf->filledRectangle($x, $y, $w, $h);
+    }
+
+    private function hline(float $x1, float $x2, float $y, array $rgb, float $width = 0.6): void
+    {
+        $this->pdf->setStrokeColor($rgb[0], $rgb[1], $rgb[2], 1);
+        $this->pdf->setLineStyle($width);
+        $this->pdf->line($x1, $y, $x2, $y);
+    }
+
+    /** Text, optionally right/centre aligned inside a box of width $w starting at $x. */
+    private function text(float $x, float $y, float $size, string $text, array $rgb, string $align = 'left', float $w = 0, bool $bold = false): void
+    {
+        $this->pdf->setColor($rgb[0], $rgb[1], $rgb[2], 1);
+        $text = Tools::fixHtml($text);
+        if ($bold) {
+            $text = '<b>' . $text . '</b>';
+        }
+        if ($align !== 'left' && $w > 0) {
+            // Cezpdf aligns by its own width measurement, which has no metric
+            // for the euro sign (WinAnsi 0x80 is missing from the built-in
+            // Helvetica tables) and so lands every EUR amount a glyph too far
+            // right. Measure the euro as a digit - same 556/1000 width in
+            // Helvetica - and left-place the text at the computed offset.
+            $measured = $this->pdf->getTextWidth($size, str_replace("\u{20AC}", '0', $text));
+            $x += $align === 'right' ? $w - $measured : ($w - $measured) / 2;
+        }
+        $this->pdf->addText($x, $y, $size, $text);
     }
 
     /**
-     * Rate metadata stored for this invoice, or null when there is none.
+     * Bilingual label: the document language in bold caps, Spanish underneath
+     * in a lighter tone. Occupies two lines (about 16pt).
+     */
+    private function drawLabel(string $key, float $x, float $y, string $align = 'left', float $w = 0): void
+    {
+        [$primary, $es] = $this->labels($key);
+        $this->text($x, $y, 6.8, mb_strtoupper($primary), self::MUTED, $align, $w, true);
+        $this->text($x, $y - 8.5, 6.8, $es, self::FAINT, $align, $w);
+    }
+
+    /** Greedy word wrap using the PDF's own font metrics. @return string[] */
+    private function wrap(string $text, float $size, float $width): array
+    {
+        $lines = [];
+        foreach (preg_split('/\R/u', trim($text)) as $paragraph) {
+            $current = '';
+            foreach (preg_split('/\s+/u', $paragraph) as $word) {
+                $try = $current === '' ? $word : $current . ' ' . $word;
+                if ($current !== '' && $this->pdf->getTextWidth($size, Tools::fixHtml($try)) > $width) {
+                    $lines[] = $current;
+                    $current = $word;
+                } else {
+                    $current = $try;
+                }
+            }
+            $lines[] = $current;
+        }
+        return $lines;
+    }
+
+    private function newContentPage(): void
+    {
+        $this->pdf->ezNewPage();
+        $this->cy = $this->pdf->ez['pageHeight'] - 56;
+    }
+
+    // ------------------------------------------------------------------
+    // Sections
+    // ------------------------------------------------------------------
+
+    private function drawHeaderBand($model, Empresa $empresa): void
+    {
+        $pw = $this->pdf->ez['pageWidth'];
+        $ph = $this->pdf->ez['pageHeight'];
+        $bandH = 112.0;
+        $x = self::MARGIN;
+        $boxW = $pw - 2 * self::MARGIN;
+
+        $this->fill(0, $ph - $bandH, $pw, $bandH, self::NAVY);
+        $this->fill(0, $ph - $bandH - 3, $pw, 3, self::ACCENT);
+
+        $name = (string)$empresa->nombre;
+        $this->text($x, $ph - 56, mb_strlen($name) > 22 ? 17 : 21, $name, self::WHITE, 'left', 0, true);
+        [$a, $aes] = $this->labels('autonomo');
+        $this->text($x, $ph - 74, 7.4, mb_strtoupper($a) . '  ·  ' . mb_strtoupper($aes), self::ACCENT_SOFT);
+
+        [$inv, $es] = $this->labels('invoice');
+        $this->text($x, $ph - 48, 24, $inv, self::WHITE, 'right', $boxW, true);
+        $this->text($x, $ph - 64, 9, $es, self::ACCENT_SOFT, 'right', $boxW);
+        $this->text($x, $ph - 88, 13, (string)$model->codigo, self::WHITE, 'right', $boxW, true);
+
+        $this->cy = $ph - $bandH - 3 - 26;
+    }
+
+    /** Invoice date | due date | exchange rate. */
+    private function drawMetaStrip($model): void
+    {
+        $x = self::MARGIN;
+        $y = $this->cy;
+        $foreign = $this->isForeign($model);
+        $cols = $foreign ? [0, 150, 300] : [0, 200];
+
+        $this->drawLabel('date', $x + $cols[0], $y);
+        $this->text($x + $cols[0], $y - 24, 10.5, self::longDate((string)$model->fecha, $this->lang), self::INK, 'left', 0, true);
+
+        $this->drawLabel('due', $x + $cols[1], $y);
+        $this->text($x + $cols[1], $y - 24, 10.5, self::longDate($this->dueDate($model), $this->lang), self::INK, 'left', 0, true);
+
+        if ($foreign) {
+            $this->drawLabel('rate', $x + $cols[2], $y);
+            $this->text(
+                $x + $cols[2],
+                $y - 24,
+                10.5,
+                '1 EUR = ' . number_format((float)$model->tasaconv, 4, $this->lang === 'fr_FR' ? ',' : '.', '') . ' ' . $model->coddivisa,
+                self::INK,
+                'left',
+                0,
+                true
+            );
+            $source = $this->rateSourceLine($model);
+            if ($source !== '') {
+                $this->text($x + $cols[2], $y - 35, 7.2, $source, self::MUTED);
+            }
+        }
+
+        $this->cy = $y - 54;
+    }
+
+    private function drawParties($model, Empresa $empresa, $client): void
+    {
+        $gap = 14.0;
+        $w = ($this->contentWidth() - $gap) / 2;
+        $x = self::MARGIN;
+
+        $from = [[Tools::fixHtml((string)$empresa->nombre), true]];
+        foreach ($this->companyLines($empresa) as $line) {
+            $from[] = [$line, false];
+        }
+
+        $to = [[Tools::fixHtml((string)($model->nombrecliente ?: ($client->nombre ?? ''))), true]];
+        foreach ($this->clientLines($model, $client) as $line) {
+            $to[] = [$line, false];
+        }
+
+        $rows = max(count($from), count($to));
+        $h = 40 + $rows * 11.5;
+        $top = $this->cy;
+
+        foreach ([[$x, 'from', $from], [$x + $w + $gap, 'billto', $to]] as [$bx, $key, $lines]) {
+            $this->fill($bx, $top - $h, $w, $h, self::CARD);
+            $this->fill($bx, $top - $h, 2.5, $h, self::ACCENT);
+            $this->drawLabel($key, $bx + 14, $top - 14);
+            $ly = $top - 40;
+            foreach ($lines as [$line, $bold]) {
+                $this->text($bx + 14, $ly, $bold ? 10 : 8.4, $line, $bold ? self::INK : self::MUTED, 'left', 0, $bold);
+                $ly -= $bold ? 14 : 11.5;
+            }
+        }
+
+        $this->cy = $top - $h - 26;
+    }
+
+    private function drawLines($model): void
+    {
+        $x = self::MARGIN;
+        $total = $this->contentWidth();
+        $foreign = $this->isForeign($model);
+        $cur = (string)$model->coddivisa;
+        $rate = (float)$model->tasaconv;
+
+        // columns: description | qty | unit price | amount
+        $qtyX = $x + $total * 0.50;
+        $qtyW = $total * 0.08;
+        $unitX = $x + $total * 0.58;
+        $unitW = $total * 0.20;
+        $amtX = $x + $total * 0.78;
+        $amtW = $total * 0.22;
+        $descW = $total * 0.46;
+
+        $y = $this->cy;
+        $this->drawLabel('description', $x, $y);
+        $this->drawLabel('qty', $qtyX, $y, 'right', $qtyW);
+        $this->drawLabel('unit', $unitX, $y, 'right', $unitW);
+        $this->drawLabel('amount', $amtX, $y, 'right', $amtW);
+        $y -= 17;
+        $this->hline($x, $x + $total, $y, self::INK, 1.1);
+        $y -= 6;
+
+        foreach ($model->getLines() as $line) {
+            $desc = (empty($line->referencia) ? '' : $line->referencia . ' - ') . $line->descripcion;
+            $wrapped = $this->wrap($desc, 9.6, $descW);
+            $rowH = max($foreign ? 34.0 : 24.0, count($wrapped) * 12.5 + 14);
+
+            if ($y - $rowH < 300) {
+                $this->newContentPage();
+                $y = $this->cy;
+            }
+
+            $ty = $y - 15;
+            foreach ($wrapped as $i => $part) {
+                $this->text($x, $ty - $i * 12.5, 9.6, $part, self::INK);
+            }
+            $this->text($qtyX, $ty, 9.6, rtrim(rtrim(number_format((float)$line->cantidad, 2, '.', ''), '0'), '.'), self::INK, 'right', $qtyW);
+
+            $unit = (float)$line->pvpunitario;
+            $sum = (float)$line->pvptotal;
+            $this->text($unitX, $ty, 9.6, self::money($unit, $cur, $this->lang), self::INK, 'right', $unitW);
+            $this->text($amtX, $ty, 9.6, self::money($sum, $cur, $this->lang), self::INK, 'right', $amtW, true);
+            if ($foreign) {
+                $this->text($unitX, $ty - 12, 8, self::money(self::toEur($unit, $rate), 'EUR', $this->lang), self::MUTED, 'right', $unitW);
+                $this->text($amtX, $ty - 12, 8, self::money(self::toEur($sum, $rate), 'EUR', $this->lang), self::MUTED, 'right', $amtW);
+            }
+
+            $y -= $rowH;
+            $this->hline($x, $x + $total, $y, self::LINE);
+        }
+
+        $this->cy = $y - 22;
+    }
+
+    private function drawTotals($model): void
+    {
+        if ($this->cy < 250) {
+            $this->newContentPage();
+        }
+
+        $x = self::MARGIN;
+        $total = $this->contentWidth();
+        $foreign = $this->isForeign($model);
+        $cur = (string)$model->coddivisa;
+        $rate = (float)$model->tasaconv;
+        $top = $this->cy;
+
+        // totals card, right-aligned; two number columns when foreign
+        $cardW = 270.0;
+        $cx = $x + $total - $cardW;
+        $curRight = $foreign ? $cx + 130 : $cx + $cardW;
+        $eurRight = $cx + $cardW;
+        $y = $top;
+
+        if ($foreign) {
+            $this->text($cx, $y - 2, 7.2, $cur, self::MUTED, 'right', $curRight - $cx, true);
+            $this->text($cx, $y - 2, 7.2, 'EUR', self::MUTED, 'right', $eurRight - $cx, true);
+            $y -= 16;
+        }
+
+        $hasVat = abs((float)$model->totaliva) > 0.004;
+        foreach ([['subtotal', (float)$model->neto, true], ['vat', (float)$model->totaliva, $hasVat]] as [$key, $value, $show]) {
+            [$primary, $es] = $this->labels($key);
+            $this->text($cx, $y, 9, $primary, self::INK);
+            $labelEnd = $cx + $this->pdf->getTextWidth(9, $primary) + 5;
+            if ($es !== $primary) {
+                $this->text($labelEnd, $y, 7, $es, self::FAINT);
+            }
+            if ($show) {
+                $this->text($cx, $y, 9, self::money($value, $cur, $this->lang), self::INK, 'right', $curRight - $cx);
+                if ($foreign) {
+                    $this->text($cx, $y, 9, self::money(self::toEur($value, $rate), 'EUR', $this->lang), self::MUTED, 'right', $eurRight - $cx);
+                }
+            } else {
+                $na = $this->labels('na');
+                $this->text($cx, $y, 7.4, mb_strtolower($na[0]) . ' · ' . mb_strtolower($na[1]), self::MUTED, 'right', $eurRight - $cx);
+            }
+            $y -= 17;
+            $this->hline($cx, $x + $total, $y + 11, self::LINE);
+        }
+
+        // grand total bar
+        $barH = 34.0;
+        $y -= 4;
+        $barY = $y - $barH + 10;
+        $this->fill($cx, $barY, $cardW, $barH, self::NAVY);
+        $this->fill($cx, $barY, 3, $barH, self::ACCENT);
+        [$tp, $te] = $this->labels('total');
+        $this->text($cx + 14, $y - 6, 10.5, $tp, self::WHITE, 'left', 0, true);
+        $this->text($cx + 14, $y - 17, 6.8, $te, self::ACCENT_SOFT);
+        $this->text($cx, $y - 8, 11, self::money((float)$model->total, $cur, $this->lang), self::WHITE, 'right', $curRight - $cx - ($foreign ? 0 : 12), true);
+        if ($foreign) {
+            $this->text($cx, $y - 8, 11, self::money(round((float)$model->totaleuros, 2), 'EUR', $this->lang), self::ACCENT_SOFT, 'right', $eurRight - $cx - 12, true);
+        }
+
+        // VAT statement and notes on the left, beside the totals
+        $leftW = $total - $cardW - 26;
+        $ly = $top;
+        $statements = $this->vatStatements($model);
+        if ($statements !== []) {
+            $this->drawLabel('vatnote', $x, $ly);
+            $ly -= 24;
+            foreach ($statements as [$tag, $statement]) {
+                foreach ($this->wrap($statement, 7.6, $leftW - 18) as $i => $part) {
+                    if ($i === 0) {
+                        $this->text($x, $ly, 7, $tag, self::ACCENT, 'left', 0, true);
+                    }
+                    $this->text($x + 18, $ly, 7.6, $part, self::MUTED);
+                    $ly -= 10;
+                }
+                $ly -= 3;
+            }
+        }
+        $notes = $this->customNotes($model);
+        if ($notes !== '') {
+            $ly -= 4;
+            $this->drawLabel('notes', $x, $ly);
+            $ly -= 24;
+            foreach ($this->wrap($notes, 7.6, $leftW) as $part) {
+                $this->text($x, $ly, 7.6, $part, self::MUTED);
+                $ly -= 10;
+            }
+        }
+
+        $this->cy = min($barY, $ly) - 28;
+    }
+
+    private function drawPayment($model): void
+    {
+        $account = $this->getCompanyBankAccount((int)$model->idempresa);
+        $x = self::MARGIN;
+        $w = $this->contentWidth();
+        $h = 74.0;
+
+        if ($this->cy - $h < 60) {
+            $this->newContentPage();
+        }
+        $top = $this->cy;
+        $this->fill($x, $top - $h, $w, $h, self::CARD);
+
+        $pad = 14.0;
+        $x1 = $x + $pad;
+        $x2 = $x + $w * 0.30;
+        $x3 = $x + $w * 0.74;
+
+        $this->drawLabel('method', $x1, $top - 14);
+        [$tp, $tes] = $this->labels('transfer');
+        $this->text($x1, $top - 38, 9.4, $tp, self::INK, 'left', 0, true);
+        $this->text($x1, $top - 49, 7.4, $tes, self::MUTED);
+
+        $this->drawLabel('bank', $x2, $top - 14);
+        if (null !== $account) {
+            $this->text($x2, $top - 38, 9.4, 'IBAN ' . $account->getIban(true), self::INK, 'left', 0, true);
+            if (!empty($account->swift)) {
+                $this->text($x2, $top - 49, 7.6, 'BIC ' . $account->swift, self::MUTED);
+            }
+        }
+
+        $this->drawLabel('terms', $x3, $top - 14);
+        [$mp, $mes] = $this->labels('monthend');
+        $this->text($x3, $top - 38, 9.4, $mp . ' · ' . $mes, self::INK, 'left', 0, true);
+        $due = $this->dueDate($model);
+        if ($due !== '') {
+            $this->text($x3, $top - 49, 7.6, self::longDate($due, $this->lang), self::MUTED);
+        }
+
+        if (null !== $account && !empty($account->descripcion)) {
+            [$hp, $hs] = $this->labels('holder');
+            $this->text($x2, $top - 60, 7.6, $hp . ' / ' . $hs . ': ' . Tools::fixHtml($account->descripcion), self::MUTED);
+        }
+
+        $this->cy = $top - $h - 20;
+    }
+
+    private function drawFooter(Empresa $empresa): void
+    {
+        $x = self::MARGIN;
+        $w = $this->contentWidth();
+        $y = 34.0;
+        $this->hline($x, $x + $w, $y + 12, self::LINE);
+
+        $parts = [(string)$empresa->nombre, 'autónomo'];
+        foreach (['email', 'telefono1'] as $field) {
+            if (!empty($empresa->{$field})) {
+                $parts[] = (string)$empresa->{$field};
+            }
+        }
+        $this->text($x, $y, 7.4, implode('  ·  ', $parts), self::MUTED);
+        $this->pdf->setColor(0, 0, 0, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Data helpers
+    // ------------------------------------------------------------------
+
+    /**
+     * True for a document in a currency other than EUR with a usable rate: the
+     * only case where the two-currency layout applies.
+     */
+    private function isForeign($model): bool
+    {
+        return !empty($model->coddivisa) && $model->coddivisa !== 'EUR' && !empty($model->tasaconv);
+    }
+
+    private function dueDate($model): string
+    {
+        return (string)($model->fechadevengo ?: ($model->finoferta ?? ''));
+    }
+
+    /** @return string[] */
+    private function companyLines(Empresa $empresa): array
+    {
+        $lines = [];
+        if (!empty($empresa->cifnif)) {
+            $lines[] = 'NIF ' . $empresa->cifnif;
+        }
+        foreach ($this->addressLines($empresa->direccion, $empresa->codpostal, $empresa->ciudad, $empresa->provincia, $empresa->codpais) as $l) {
+            $lines[] = $l;
+        }
+        foreach (['email', 'telefono1', 'web'] as $field) {
+            if (!empty($empresa->{$field})) {
+                $lines[] = Tools::fixHtml((string)$empresa->{$field});
+            }
+        }
+        return $lines;
+    }
+
+    /** @return string[] */
+    private function clientLines($model, $client): array
+    {
+        $lines = [];
+        if (!empty($model->cifnif)) {
+            $lines[] = ($this->lang === 'fr_FR' ? 'N° TVA ' : 'Tax ID ') . $model->cifnif;
+        }
+        foreach ($this->addressLines($model->direccion ?? '', $model->codpostal ?? '', $model->ciudad ?? '', $model->provincia ?? '', $model->codpais ?? '') as $l) {
+            $lines[] = $l;
+        }
+        foreach (['telefono1', 'email', 'web'] as $field) {
+            if (!empty($client->{$field})) {
+                $lines[] = Tools::fixHtml((string)$client->{$field});
+            }
+        }
+        return $lines;
+    }
+
+    /** @return string[] */
+    private function addressLines($street, $zip, $city, $province, $country): array
+    {
+        $lines = [];
+        if (!empty($street)) {
+            $lines[] = Tools::fixHtml((string)$street);
+        }
+        $place = trim(implode(' ', array_filter([(string)$zip, (string)$city])));
+        // "Dublin, Ohio" + province "Ohio" would print Ohio twice
+        if (!empty($province) && stripos($place, (string)$province) === false) {
+            $place .= ($place === '' ? '' : ' ') . '(' . $province . ')';
+        }
+        if ($place !== '') {
+            $lines[] = Tools::fixHtml($place);
+        }
+        if (!empty($country)) {
+            $pais = new Pais();
+            $lines[] = Tools::fixHtml($pais->load((string)$country) ? (string)$pais->nombre : (string)$country);
+        }
+        return $lines;
+    }
+
+    /**
+     * "ECB reference rate · 19 October 2026" from the stored rate metadata, or
+     * nothing for older invoices: claiming a source we cannot prove would be a
+     * guess.
+     */
+    private function rateSourceLine($model): string
+    {
+        $meta = $this->rateMeta($model);
+        if (null === $meta) {
+            return '';
+        }
+        $fr = $this->lang === 'fr_FR';
+        $source = $meta['source'] === Rate::SOURCE_MANUAL
+            ? ($fr ? 'Taux manuel' : 'Manual rate')
+            : ($fr ? 'Taux de référence BCE' : RateToken::sourceLabel($meta['source']));
+        return $source . ' · ' . self::longDate($meta['date'], $this->lang);
+    }
+
+    /**
+     * Rate metadata stored for this invoice (company + code scoped, see
+     * Lib\RateToken - the code alone is not unique across the two companies),
+     * or null when there is none.
      *
-     * Read through Tools::settings() (the getter) with an empty default: the
-     * key's absence is the documented "older invoice" case, and decode()
-     * rejects anything malformed, so a hand-edited or truncated value degrades
-     * to the invoice-date fallback instead of breaking the render.
-     *
-     * @param object $model
      * @return array{date: string, source: string}|null
      */
     private function rateMeta($model): ?array
     {
-        // Company-scoped: the code alone identifies an invoice only within one
-        // company's series (both companies' September invoice is F2600010), so
-        // looking it up by code would print another company's rate here.
         $key = RateToken::key((int)($model->idempresa ?? 0), (string)($model->codigo ?? ''));
         if ($key === '') {
             return null;
         }
-
         $stored = Tools::settings(RateToken::GROUP, $key, '');
-
         return RateToken::decode(is_string($stored) ? $stored : null);
     }
 
     /**
-     * Suppresses core's VAT-exception block so it can be printed in both
-     * languages instead of only the UI's.
+     * VAT statement in the document language and in Spanish, from the core
+     * translations of the lines' `excepcioniva` codes - the legal text the rest
+     * of the application uses, so none is invented here.
      *
-     * Core (PDFDocument::insertBusinessDocFooter) prints the heading plus one
-     * line per exception code, translated into the current language only — on a
-     * French instance that was French, on this export it would be English
-     * alone, while the client must be able to read the Spanish legal wording
-     * (§4.4). insertBilingualTaxExceptions() renders the same core translation
-     * keys (Core/Translation/en_EN.json + es_ES.json) for both languages, so no
-     * legal text is invented here. This hook is the only consumer of
-     * getTaxExceptions() in core (verified by grep), so returning an empty set
-     * removes exactly that block and nothing else.
-     *
-     * @param object $model
+     * @return array<int, array{0: string, 1: string}> [tag, text] pairs
      */
-    protected function getTaxExceptions($model): array
-    {
-        return [];
-    }
-
-    /**
-     * Appends our blocks after everything the core footer prints (tax
-     * breakdown, totals, receipts, format text).
-     *
-     * Placed here rather than in insertBusinessDocBody() because the body is
-     * followed by the totals block, which the core itself may shift down to
-     * INVOICE_TOTALS_Y or push onto a new page: anything drawn from the body
-     * would end up on top of the totals. The footer method is the last thing
-     * addBusinessDocPage() runs, so a block appended to it is always below the
-     * totals and never overlaps them.
-     *
-     * Declared public for the same reason as insertBusinessDocHeader(): the
-     * parent method is protected and PHP allows widening it on override.
-     *
-     * @param object $model
-     */
-    public function insertBusinessDocFooter($model)
-    {
-        if ($this->isForeign($model)) {
-            $this->insertForeignFooter($model);
-            return;
-        }
-
-        // Core prints `observaciones` verbatim. Nothing writes the
-        // machine-readable rate token there any more (it lives in Settings, see
-        // Lib\RateToken), but invoices issued before that change still carry one
-        // in the database: strip it here so this export stays clean even on an
-        // unmigrated instance, then restore the model exactly as it was - a PDF
-        // render must never mutate the document it is rendering.
-        $rawObservaciones = $model->observaciones ?? null;
-        $model->observaciones = RateToken::strip($rawObservaciones);
-        try {
-            parent::insertBusinessDocFooter($model);
-        } finally {
-            $model->observaciones = $rawObservaciones;
-        }
-
-        $this->insertBilingualTaxExceptions($model);
-        $this->insertBankDetails((int)$model->idempresa);
-        $this->insertPaymentTerms($model);
-        $this->insertLegalFooter((int)$model->idempresa);
-    }
-
-    /**
-     * Footer of a foreign-currency invoice: observations, a totals table with
-     * a USD and a EUR column, the bilingual VAT statement, then payment terms,
-     * bank details and the legal line.
-     *
-     * Replaces core's footer instead of extending it: core's totals table is
-     * single-currency and prints the currency as the localized "DOLLAR
-     * AMERICAIN" and the receipt's payment method as the instance default
-     * ("Par defaut" on a French UI), neither of which belongs on a client
-     * document. Every number is still read from the model, never recomputed
-     * from scratch.
-     *
-     * @param object $model
-     */
-    private function insertForeignFooter($model): void
-    {
-        $cur = (string)$model->coddivisa;
-        $rate = (float)$model->tasaconv;
-
-        $this->insertTotals($model, $cur, $rate);
-        $this->insertBilingualTaxExceptions($model);
-
-        // The observation sentence is client-facing (rate, source, VAT basis);
-        // strip the legacy machine token exactly as the core path does.
-        $observations = trim((string)RateToken::strip($model->observaciones ?? null));
-        if ($observations !== '') {
-            $this->insertBlock(['Notes / Notas', Tools::fixHtml($observations)]);
-        }
-
-        $this->insertBankDetails((int)$model->idempresa);
-        $this->insertPaymentTerms($model);
-        $this->insertLegalFooter((int)$model->idempresa);
-    }
-
-    /**
-     * Subtotal, VAT and total in both currencies. The EUR total is the model's
-     * own totaleuros (what accounting booked); subtotal and VAT convert with
-     * the same rate.
-     *
-     * @param object $model
-     */
-    private function insertTotals($model, string $cur, float $rate): void
-    {
-        $hasVat = abs((float)$model->totaliva) > 0.004;
-        $rows = [
-            [
-                'label' => 'Subtotal',
-                'cur' => self::money((float)$model->neto, $cur),
-                'eur' => self::money(self::toEur((float)$model->neto, $rate), 'EUR'),
-            ],
-            [
-                'label' => 'VAT / IVA',
-                'cur' => $hasVat ? self::money((float)$model->totaliva, $cur) : 'Not applicable / No aplicable',
-                'eur' => $hasVat ? self::money(self::toEur((float)$model->totaliva, $rate), 'EUR') : '',
-            ],
-            [
-                'label' => '<b>Total</b>',
-                'cur' => '<b>' . self::money((float)$model->total, $cur) . '</b>',
-                'eur' => '<b>' . self::money(round((float)$model->totaleuros, 2), 'EUR') . '</b>',
-            ],
-        ];
-
-        $this->pdf->ezText("\n", 4);
-        $this->pdf->ezTable($rows, ['label' => '', 'cur' => $cur, 'eur' => 'EUR'], '', [
-            'cols' => [
-                'cur' => ['justification' => 'right'],
-                'eur' => ['justification' => 'right'],
-            ],
-            'shadeCol' => [0.95, 0.95, 0.95],
-            'shadeHeadingCol' => [0.95, 0.95, 0.95],
-            'xPos' => 'right',
-            'xOrientation' => 'left',
-            'width' => 300,
-        ]);
-        $this->blocksPrinted = 0;
-    }
-
-    /**
-     * VAT statement in English and Spanish.
-     *
-     * The wording comes from the core translations of the line's
-     * `excepcioniva` code (arts. 68-70 LIVA for services to a non-EU business),
-     * fetched with Translator::customTrans() so the same legal text the rest of
-     * the application uses is printed in both languages.
-     *
-     * @param object $model
-     */
-    private function insertBilingualTaxExceptions($model): void
+    private function vatStatements($model): array
     {
         $codes = [];
         foreach ($model->getLines() as $line) {
@@ -468,29 +796,38 @@ class ZasadyExport extends PDFExport
             }
         }
         if ($codes === []) {
-            return;
+            return [];
         }
 
         $all = TaxExceptions::all();
-        $lines = ['VAT / IVA'];
+        $out = [];
         foreach (array_keys($codes) as $code) {
             $key = $all[$code] ?? null;
-            $en = null === $key ? $code : $this->i18n->customTrans('en_EN', $key);
-            $es = null === $key ? $code : $this->i18n->customTrans('es_ES', $key);
-            $lines[] = 'EN: ' . Tools::fixHtml($this->printableDashes($en));
-            $lines[] = 'ES: ' . Tools::fixHtml($this->printableDashes($es));
+            foreach ([$this->lang, 'es_ES'] as $lang) {
+                $text = null === $key ? $code : $this->i18n->customTrans($lang, $key);
+                $out[] = [strtoupper(substr($lang, 0, 2)), $this->printableDashes($text)];
+            }
         }
-
-        $this->insertBlock($lines);
+        return $out;
     }
 
     /**
-     * Replaces typographic dashes with ASCII ones for printing.
-     *
-     * The core translations spell "Arts. 68–70" with en dashes. Cezpdf's WinAnsi
-     * font handling does not round-trip them (the extracted text reads
-     * "Arts. 6870"), which on a legal paragraph reads as a missing article
-     * range. A plain hyphen keeps the meaning and prints reliably.
+     * Free-text notes typed on the invoice. The sentence Issuer generates
+     * (rate + "out of scope under arts. 68-70") is skipped: the rate is in the
+     * meta strip and the legal basis in the VAT statement, in two languages.
+     */
+    private function customNotes($model): string
+    {
+        $notes = trim((string)RateToken::strip($model->observaciones ?? null));
+        if ($notes === '' || preg_match('/^(ECB reference rate|Manual rate)\b.*arts\. 68-70/su', $notes) === 1) {
+            return '';
+        }
+        return $notes;
+    }
+
+    /**
+     * Replaces typographic dashes with ASCII ones. Cezpdf's WinAnsi handling
+     * does not round-trip the en dash ("Arts. 68-70" extracts as "6870").
      */
     private function printableDashes(?string $text): string
     {
@@ -498,156 +835,20 @@ class ZasadyExport extends PDFExport
     }
 
     /**
-     * Bank details of the issuing company, or nothing when it has no account.
-     *
-     * No idempresa means we cannot know which company issued the document, and
-     * guessing (default setting) could print another company's account on a
-     * legal document, so it is skipped.
-     */
-    private function insertBankDetails(int $idempresa): void
-    {
-        $account = $this->getCompanyBankAccount($idempresa);
-        if (null === $account) {
-            return;
-        }
-
-        // Labels are only built for fields that actually carry a value: a
-        // payment block showing "BIC:" with nothing behind it is worse than no
-        // block at all, and the heading itself is emitted only together with at
-        // least the IBAN (getCompanyBankAccount() guarantees it).
-        $lines = ['Bank details / Datos bancarios'];
-        $lines[] = 'Payment method / Forma de pago: Bank transfer / Transferencia bancaria';
-        $lines[] = 'IBAN: ' . $account->getIban(true);
-        if (!empty($account->swift)) {
-            $lines[] = 'BIC: ' . $account->swift;
-        }
-        if (!empty($account->descripcion)) {
-            // fixHtml() because ezText() parses markup (<b>, <c:alink:...>):
-            // an account holder with an accidental '<' must print literally.
-            $lines[] = 'Holder / Titular: ' . Tools::fixHtml($account->descripcion);
-        }
-
-        $this->insertBlock($lines);
-    }
-
-    /**
-     * Payment-terms line built from fechadevengo.
-     *
-     * The terms are "month-end", which formaspago cannot express, and nothing
-     * in the stock template prints fechadevengo at all — the visible due date
-     * used to be the receipt's formaspago-derived vencimiento (19-10-2026 for
-     * one company, 19-09-2026 for the other, on the same invoice date). Issuer
-     * now aligns the receipts to fechadevengo; printing it here as well makes
-     * the term explicit instead of leaving the client to infer it.
-     *
-     * @param object $model
-     */
-    private function insertPaymentTerms($model): void
-    {
-        if (empty($model->fechadevengo)) {
-            return;
-        }
-
-        $this->insertBlock([
-            'Payment terms / Condiciones de pago: month-end / fin de mes - due '
-            . $this->dateLabel($model->fechadevengo),
-        ]);
-    }
-
-    /**
-     * Legal footer: "<company name> - autonomo - <email>" of the issuing
-     * company, read from the empresa record.
-     */
-    private function insertLegalFooter(int $idempresa): void
-    {
-        if ($idempresa <= 0) {
-            return;
-        }
-
-        $empresa = new Empresa();
-        if (false === $empresa->load($idempresa) || empty($empresa->nombre)) {
-            return;
-        }
-
-        $line = Tools::fixHtml($empresa->nombre) . ' - autónomo';
-        if (!empty($empresa->email)) {
-            $line .= ' - ' . Tools::fixHtml($empresa->email);
-        }
-
-        $this->insertBlock([$line]);
-    }
-
-    /**
-     * Prints a block of lines, moving it to a fresh page when it would not fit.
-     *
-     * ezText() page-breaks per line, so a block started near the bottom margin
-     * would leave its heading alone on one page and its content on the next.
-     * (FONT_SIZE + 3 over-estimates Cezpdf's line height on purpose, so the
-     * check errs towards breaking early.)
-     *
-     * @param string[] $lines
-     */
-    private function insertBlock(array $lines): void
-    {
-        if ($lines === []) {
-            return;
-        }
-
-        $blockHeight = count($lines) * (self::FONT_SIZE + 3);
-        // Only the first appended block gets a separating blank line: each one
-        // costs a full line of an already tight single-invoice page, and three
-        // of them were enough to push the bank/terms/footer onto a second page
-        // (spec §4.4 asks for one page per single-line invoice).
-        $leadingBlank = $this->blocksPrinted > 0 ? false : true;
-        if ($this->pdf->y - $blockHeight < $this->pdf->ez['bottomMargin']) {
-            $this->pdf->ezNewPage();
-            // At the top of a fresh page the separating blank line is noise.
-            $leadingBlank = false;
-        }
-
-        $this->blocksPrinted++;
-        $this->pdf->ezText(($leadingBlank ? "\n" : '') . $lines[0], self::FONT_SIZE);
-        foreach (array_slice($lines, 1) as $line) {
-            $this->pdf->ezText($line, self::FONT_SIZE);
-        }
-    }
-
-    /**
-     * Formats a date for printing. Core models hand date fields back in the
-     * instance's DATE_STYLE while values we build ourselves (the rate token)
-     * are ISO, so accept both instead of guessing one format.
-     */
-    private function dateLabel(?string $date): string
-    {
-        $value = (string)$date;
-        if ($value === '') {
-            return '';
-        }
-
-        return preg_match('/^\d{4}-\d{2}-\d{2}$/', $value) === 1 ? Tools::date($value) : $value;
-    }
-
-    /**
-     * Returns the company's bank account to print, or null when there is none.
-     *
-     * cuentasbanco holds one row per company account, keyed only by codcuenta,
-     * and has no holder column (the holder is stored in descripcion). Ordering
-     * by codcuenta and taking the first row that carries an IBAN keeps the
-     * choice reproducible if a company ever has several rows: the lowest
-     * codcuenta wins, and rows without an IBAN are not payment data.
+     * The company's bank account to print, or null. cuentasbanco has no holder
+     * column (it lives in descripcion); the lowest codcuenta with an IBAN wins
+     * so the choice is reproducible.
      */
     private function getCompanyBankAccount(int $idempresa): ?CuentaBanco
     {
         if ($idempresa <= 0) {
             return null;
         }
-
         foreach (CuentaBanco::allWhereEq('idempresa', $idempresa, ['codcuenta' => 'ASC']) as $account) {
             if (!empty($account->iban)) {
                 return $account;
             }
         }
-
         return null;
     }
 }
