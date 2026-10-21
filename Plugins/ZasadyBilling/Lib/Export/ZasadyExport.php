@@ -195,6 +195,19 @@ class ZasadyExport extends PDFExport
     }
 
     /**
+     * A single-page invoice carries no "1 / 1": core registers the page
+     * numbering when the document is created, so it is dropped here, once the
+     * page count is known. Multi-page invoices keep "n / N".
+     */
+    public function getDoc()
+    {
+        if ($this->pdf !== null && (int)$this->pdf->ezPageCount <= 1) {
+            unset($this->pdf->ez['pageNumbering']);
+        }
+        return parent::getDoc();
+    }
+
+    /**
      * Download name. ExportBase::$fileName is private and write-once, so the
      * name is overridden on the response. Quotes and path separators are
      * stripped; spaces stay: "Arlem Gomez - Invoice F2600010.pdf".
