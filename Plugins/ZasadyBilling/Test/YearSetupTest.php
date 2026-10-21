@@ -76,4 +76,32 @@ final class YearSetupTest extends TestCase
         $this->assertSame('F{ANYO2}{0NUM}', YearSetup::PATTERN);
         $this->assertSame(5, YearSetup::LONGNUMERO);
     }
+
+    /** @dataProvider names */
+    public function testCodePrefixIsTheFirstTwoInitials(string $name, string $prefix): void
+    {
+        $this->assertSame($prefix, YearSetup::codePrefix($name));
+    }
+
+    public static function names(): array
+    {
+        return [
+            ['Arlem Gomez', 'AG'],
+            ['David-Solal Chalmeau', 'DS'],
+            ["  \u{00C9}milie  du Pont ", 'ED'],
+            ['Madonna', ''],
+            ['1234', ''],
+        ];
+    }
+
+    public function testCandidateCodeUsesTheCompanyPrefixFirst(): void
+    {
+        $this->assertSame('AG28', YearSetup::candidateCode('2028-03-01', 2, static fn (string $c): bool => false, 'AG'));
+        $this->assertSame('DS28', YearSetup::candidateCode('2028-03-01', 1, static fn (string $c): bool => false, 'DS'));
+    }
+
+    public function testCandidateCodeFallsBackToCoreCodesIfThePrefixedOneIsTaken(): void
+    {
+        $this->assertSame('2028', YearSetup::candidateCode('2028-03-01', 1, static fn (string $c): bool => $c === 'DS28', 'DS'));
+    }
 }

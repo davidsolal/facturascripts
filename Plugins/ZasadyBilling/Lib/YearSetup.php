@@ -91,7 +91,8 @@ final class YearSetup
             $codejercicio = self::candidateCode(
                 $isoDate,
                 $idempresa,
-                static fn (string $code): bool => (new Ejercicio())->load($code)
+                static fn (string $code): bool => (new Ejercicio())->load($code),
+                self::companyPrefix($idempresa)
             );
             $exerciseOpen = false;
         }
@@ -136,7 +137,10 @@ final class YearSetup
         // date, core creates it exactly as BusinessDocument::save() would -
         // doing it here, before any invoice is built, means the sequence
         // created below never has to race core's own auto-create.
-        if (false === $ejercicio->loadFromDate($isoDate, false, true)) {
+        if (false === $ejercicio->loadFromDate($isoDate, false, false)) {
+            self::createExercise($ejercicio, $idempresa, $isoDate);
+        }
+        if (empty($ejercicio->codejercicio)) {
             throw new \RuntimeException(
                 'could not load or create an exercise for ' . $isoDate . ' (company ' . $idempresa . ')'
             );
@@ -186,6 +190,25 @@ final class YearSetup
     }
 
     /**
+     * Exercise-code prefix for a company: the initials of the first two words
+     * of its name, letters only, upper case ("Arlem Gomez" -> "AG",
+     * "David-Solal Chalmeau" -> "DS"). Codes are 4 characters and unique across
+     * ALL companies, so "AG28" / "DS28" say whose year it is at a glance where
+     * core would give the second company "0028". Empty when the name has no
+     * usable letters (core's numeric codes are used then).
+     */
+    public static function codePrefix(string $companyName): string
+    {
+        $ascii = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $companyName);
+        $words = preg_split('/[^A-Za-z]+/', (string)$ascii, -1, PREG_SPLIT_NO_EMPTY);
+        $initials = '';
+        foreach (array_slice($words ?: [], 0, 2) as $word) {
+            $initials .= strtoupper($word[0]);
+        }
+        return strlen($initials) === 2 ? $initials : '';
+    }
+
+    /**
      * Replicates Ejercicio::createNew()'s own collision fallback - plain
      * year, then '00'+yy, then '0'+idempresa+yy, then the first free
      * 0001-9999 - without writing anything, so preview() can report the
@@ -194,7 +217,7 @@ final class YearSetup
      * codejercicio ALONE (not per company), which is exactly why company 2
      * ends up with '0026' once company 1 has already taken '2026'.
      */
-    public static function candidateCode(string $isoDate, int $idempresa, callable $exists): string
+    public static function candidateCode(string $isoDate, int $idempresa, callable $exists, string $prefix = ''): string
     {
         $date = strtotime($isoDate);
         if (false === $date) {
@@ -204,7 +227,15 @@ final class YearSetup
         $year = date('Y', $date);
         $year2 = date('y', $date);
 
-        foreach ([$year, '00' . $year2, sprintf('%04s', '0' . $idempresa . $year2)] as $candidate) {
+        // The company's initials + 2-digit year ("AG28") come first when a
+        // prefix is known; core's own fallbacks stay behind it as a safety net.
+        $candidates = [];
+        if ($prefix !== '') {
+            $candidates[] = substr($prefix . $year2, 0, 4);
+        }
+        array_push($candidates, $year, '00' . $year2, sprintf('%04s', '0' . $idempresa . $year2));
+
+        foreach ($candidates as $candidate) {
             if (false === $exists($candidate)) {
                 return $candidate;
             }
@@ -221,6 +252,52 @@ final class YearSetup
         // but core's own createNew() has the same unguarded loop - mirrored
         // here, not improved on, since this function's job is prediction.
         throw new \RuntimeException('no free exercise code available');
+    }
+
+    private static function companyPrefix(int $idempresa): string
+    {
+        $empresa = new \FacturaScripts\Core\Model\Empresa();
+        return $empresa->load($idempresa) ? self::codePrefix((string)($empresa->nombrecorto ?: $empresa->nombre)) : '';
+    }
+
+    /**
+     * Creates the exercise for the calendar year of $isoDate exactly as core's
+     * Ejercicio::createNew() does (same dates, same name, same subaccount
+     * length inherited from the company's latest exercise) except for the
+     * code, which comes from candidateCode() with the company's prefix.
+     */
+    private static function createExercise(Ejercicio $ejercicio, int $idempresa, string $isoDate): void
+    {
+        $time = strtotime($isoDate);
+        if (false === $time) {
+            return;
+        }
+        $year = date('Y', $time);
+
+        $previous = new Ejercicio();
+        $long = $previous->loadWhere([Where::eq('idempresa', $idempresa)], ['fechainicio' => 'DESC'])
+            ? $previous->longsubcuenta
+            : null;
+
+        $new = new Ejercicio();
+        $new->idempresa = $idempresa;
+        $new->codejercicio = self::candidateCode(
+            $isoDate,
+            $idempresa,
+            static fn (string $code): bool => (new Ejercicio())->load($code),
+            self::companyPrefix($idempresa)
+        );
+        $new->fechainicio = date('1-1-Y', $time);
+        $new->fechafin = date('31-12-Y', $time);
+        $empresa = new \FacturaScripts\Core\Model\Empresa();
+        $empresa->load($idempresa);
+        $new->nombre = ((string)($empresa->nombrecorto ?: $empresa->nombre)) . ' ' . $year;
+        if (null !== $long) {
+            $new->longsubcuenta = $long;
+        }
+        if ($new->save()) {
+            $ejercicio->loadFromCode($new->codejercicio);
+        }
     }
 
     private static function findSequence(int $idempresa, string $codserie, string $codejercicio): ?SecuenciaDocumento
