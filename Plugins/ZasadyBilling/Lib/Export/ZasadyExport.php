@@ -5,6 +5,7 @@ namespace FacturaScripts\Plugins\ZasadyBilling\Lib\Export;
 use DateTimeImmutable;
 use FacturaScripts\Core\Lib\Export\PDFExport;
 use FacturaScripts\Core\Lib\TaxExceptions;
+use FacturaScripts\Core\Lib\Vies;
 use FacturaScripts\Core\Model\CuentaBanco;
 use FacturaScripts\Core\Model\Empresa;
 use FacturaScripts\Core\Model\Pais;
@@ -494,9 +495,13 @@ class ZasadyExport extends PDFExport
         $y -= 6;
 
         foreach ($model->getLines() as $line) {
-            $desc = (empty($line->referencia) ? '' : $line->referencia . ' - ') . $line->descripcion;
-            $wrapped = $this->wrap($desc, 9.6, $descW);
-            $rowH = max($foreign ? 34.0 : 24.0, count($wrapped) * 12.5 + 14);
+            // "Title\nlonger description": the title is bold, the description
+            // below it is smaller and muted, wrapped inside the column.
+            $parts = preg_split('/\R/u', trim((string)$line->descripcion), 2);
+            $title = (empty($line->referencia) ? '' : $line->referencia . ' - ') . $parts[0];
+            $detail = isset($parts[1]) ? $this->wrap(trim($parts[1]), 8.2, $descW) : [];
+            $titleLines = $this->wrap($title, 9.6, $descW);
+            $rowH = max($foreign ? 34.0 : 24.0, count($titleLines) * 12.5 + count($detail) * 10.5 + 16);
 
             if ($y - $rowH < 300) {
                 $this->newContentPage();
@@ -504,8 +509,11 @@ class ZasadyExport extends PDFExport
             }
 
             $ty = $y - 15;
-            foreach ($wrapped as $i => $part) {
-                $this->text($x, $ty - $i * 12.5, 9.6, $part, self::INK);
+            foreach ($titleLines as $i => $part) {
+                $this->text($x, $ty - $i * 12.5, 9.6, $part, self::INK, 'left', 0, $detail !== []);
+            }
+            foreach ($detail as $i => $part) {
+                $this->text($x, $ty - count($titleLines) * 12.5 - 1 - $i * 10.5, 8.2, $part, self::MUTED);
             }
             $this->text($qtyX, $ty, 9.6, rtrim(rtrim(number_format((float)$line->cantidad, 2, '.', ''), '0'), '.'), self::INK, 'right', $qtyW);
 
@@ -813,8 +821,20 @@ class ZasadyExport extends PDFExport
         }
 
         $all = TaxExceptions::all();
+        $country = $this->clientCountry($model);
         $out = [];
         foreach (array_keys($codes) as $code) {
+            // Arts. 68-70 with a known foreign customer: say who and where,
+            // not the catalogue's "e.g. EU or third countries" boilerplate.
+            if ($code === TaxExceptions::ES_TAX_EXCEPTION_68_70 && null !== $country) {
+                foreach ([$this->lang, 'es_ES'] as $lang) {
+                    $out[] = [
+                        strtoupper(substr($lang, 0, 2)),
+                        self::locationStatement($lang, $country['iso'], $this->countryName($country['iso'], $lang, $country['name'])),
+                    ];
+                }
+                continue;
+            }
             $key = $all[$code] ?? null;
             foreach ([$this->lang, 'es_ES'] as $lang) {
                 $text = null === $key ? $code : $this->i18n->customTrans($lang, $key);
@@ -822,6 +842,66 @@ class ZasadyExport extends PDFExport
             }
         }
         return $out;
+    }
+
+    /**
+     * The not-subject statement for arts. 68-70 LIVA, naming the customer's
+     * actual situation: a business established in a given country, inside or
+     * outside the EU. ASCII dashes on purpose (see printableDashes()).
+     *
+     * @param string $lang    en_EN | fr_FR | es_ES
+     * @param string $iso     customer country, ISO 3166-1 alpha-2 (not ES)
+     * @param string $country that country's name in $lang
+     */
+    public static function locationStatement(string $lang, string $iso, string $country): string
+    {
+        $eu = strtoupper($iso) === 'GR' || in_array(strtoupper($iso), Vies::EU_COUNTRIES, true);
+
+        if ($lang === 'fr_FR') {
+            $who = $eu
+                ? "une entreprise \u{00E9}tablie dans un autre \u{00C9}tat membre de l'UE ($country)"
+                : "une entreprise \u{00E9}tablie hors de l'UE ($country)";
+            return "Espagne : op\u{00E9}ration non soumise \u{00E0} la TVA - Art. 68-70 LIVA (r\u{00E8}gles de localisation). "
+                . "Prestation de services \u{00E0} $who ; le lieu de la prestation est situ\u{00E9} hors d'Espagne.";
+        }
+        if ($lang === 'es_ES') {
+            $who = $eu
+                ? "un empresario o profesional establecido en otro Estado miembro de la UE ($country)"
+                : "un empresario o profesional establecido fuera de la UE ($country)";
+            return "Espa\u{00F1}a: operaci\u{00F3}n no sujeta al IVA - Arts. 68-70 LIVA (reglas de localizaci\u{00F3}n). "
+                . "Servicios prestados a $who; el lugar de realizaci\u{00F3}n del hecho imponible se sit\u{00FA}a fuera del territorio de aplicaci\u{00F3}n del impuesto.";
+        }
+        $who = $eu
+            ? "a business established in another EU member state ($country)"
+            : "a business established outside the EU ($country)";
+        return "Spain: not subject to VAT - Arts. 68-70 VAT Law (place-of-supply rules). "
+            . "Services supplied to $who; the place of supply is outside Spain.";
+    }
+
+    /** Customer country of the document as [iso, name], or null when unknown or Spain. */
+    private function clientCountry($model): ?array
+    {
+        $code = (string)($model->codpais ?? '');
+        if ($code === '') {
+            return null;
+        }
+        $pais = new Pais();
+        if (false === $pais->load($code) || empty($pais->codiso) || strtoupper((string)$pais->codiso) === 'ES') {
+            return null;
+        }
+        return ['iso' => strtoupper((string)$pais->codiso), 'name' => (string)$pais->nombre];
+    }
+
+    /** Country name in the requested language (intl), else the stored name. */
+    private function countryName(string $iso, string $lang, string $fallback): string
+    {
+        if (class_exists(\Locale::class)) {
+            $name = \Locale::getDisplayRegion('-' . $iso, substr($lang, 0, 2));
+            if ($name !== '' && $name !== $iso) {
+                return $name;
+            }
+        }
+        return $fallback;
     }
 
     /**

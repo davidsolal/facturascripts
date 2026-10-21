@@ -66,4 +66,29 @@ final class ZasadyExportTest extends TestCase
         // 31 February must not silently roll over to March
         $this->assertSame('31-02-2026', ZasadyExport::longDate('31-02-2026'));
     }
+
+    public function testVatStatementNamesTheRealSituationOutsideTheEu(): void
+    {
+        $en = ZasadyExport::locationStatement('en_EN', 'US', 'United States');
+        $this->assertStringContainsString('a business established outside the EU (United States)', $en);
+        $this->assertStringContainsString('Arts. 68-70', $en);
+        $this->assertStringNotContainsString('e.g.', $en);
+
+        $es = ZasadyExport::locationStatement('es_ES', 'US', 'Estados Unidos');
+        $this->assertStringContainsString('establecido fuera de la UE (Estados Unidos)', $es);
+        $this->assertStringContainsString('Arts. 68-70 LIVA', $es);
+
+        $fr = ZasadyExport::locationStatement('fr_FR', 'US', 'États-Unis');
+        $this->assertStringContainsString("hors de l'UE (États-Unis)", $fr);
+    }
+
+    public function testVatStatementSaysEuMemberStateForAnEuCustomer(): void
+    {
+        $this->assertStringContainsString('another EU member state (Germany)', ZasadyExport::locationStatement('en_EN', 'DE', 'Germany'));
+        $this->assertStringContainsString('otro Estado miembro de la UE (Alemania)', ZasadyExport::locationStatement('es_ES', 'DE', 'Alemania'));
+        // Greece: Vies lists it as EL, ISO says GR
+        $this->assertStringContainsString('EU member state', ZasadyExport::locationStatement('en_EN', 'GR', 'Greece'));
+        // post-Brexit the UK is third-country
+        $this->assertStringContainsString('outside the EU', ZasadyExport::locationStatement('en_EN', 'GB', 'United Kingdom'));
+    }
 }
